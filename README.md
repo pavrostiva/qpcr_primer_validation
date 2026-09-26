@@ -75,8 +75,8 @@
 ### 1. Installation
 
 ```bash
-git clone https://github.com/pavrostiva/qPCR-Primer-Validation.git
-cd qPCR-Primer-Validation
+git clone https://github.com/pavrostiva/qpcr_primer_validation.git
+cd qpcr_primer_validation
 
 pip install streamlit plotly pandas numpy scipy openpyxl
 ```
