@@ -247,7 +247,7 @@ with st.sidebar:
     run_name = "qPCR_Run"
 
     if not use_demo:
-        input_mode = st.radio("Input mode:", ["Local folder", "Upload ZIP archive"])
+        input_mode = st.radio("Input mode:", ["Upload ZIP archive", "Local folder"])
         
         if input_mode == "Upload ZIP archive":
             uploaded_zip = st.file_uploader("Upload .ZIP archive:", type=["zip"])
