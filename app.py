@@ -1,6 +1,7 @@
 import os
 import glob
 import re
+import io
 import tempfile
 import zipfile
 import numpy as np
@@ -60,8 +61,11 @@ def find_files_recursively(base_dir: str):
         "run information", "summary", "standard curve results"
     ]
 
-    for root, _, files in os.walk(base_dir):
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d != "__MACOSX"]
         for f in files:
+            if f.startswith(("._", "~$")):
+                continue  # macOS resource forks and Excel lock files
             full_path = os.path.join(root, f)
             f_lower = f.lower()
 
@@ -144,7 +148,7 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
             parts = [p.strip() for p in tag.split("_") if p.strip()]
 
             if len(parts) >= 3:
-                primer, series, d_str = parts[0], parts[1], parts[2]
+                primer, series, d_str = "_".join(parts[:-2]), parts[-2], parts[-1]
             elif len(parts) == 2:
                 primer, series, d_str = parts[0], "std", parts[1]
             else:
@@ -318,7 +322,7 @@ with st.sidebar:
                 st.error("Folder not found.")
 
         st.markdown("---")
-        st.info("📋 **Expected files:**\n- `*Quantification Cq Results.csv`\n- `*Amplification Results.csv`\n- `*Melt Curve Derivative.csv`\n- `plate.xlsx` (or layout file)")
+        st.info("📋 **Expected files:**\n- `*Quantification Cq Results.csv`\n- `*Quantification Amplification Results*.csv`\n- `*Melt Curve Derivative Results*.csv`\n- `plate.xlsx` (or layout file)")
 
 
 # ----------------- Data Loading -----------------
@@ -355,6 +359,14 @@ else:
             st.error("Failed to parse 8x12 plate layout. Please ensure rows are labeled A through H.")
             st.stop()
 
+        bad_tags = layout_df[~layout_df["Is_Empty"] & ~layout_df["Is_NTC"] & layout_df["Dilution_Factor"].isna()]
+        if not bad_tags.empty:
+            st.warning(
+                f"⚠️ {len(bad_tags)} well(s) have a dilution that could not be read and are excluded "
+                f"(expected `Primer_Series_Dilution`): {', '.join(sorted(bad_tags['Tag'].unique()))}"
+            )
+
+        cq_df = cq_df.drop_duplicates(subset="Well", keep="first")
         merged_df = pd.merge(layout_df, cq_df[["Well", "Cq"]], on="Well", how="left")
         layout_name = os.path.basename(found["layout"])
 
@@ -383,7 +395,7 @@ for _, c_r in conditions.iterrows():
     p, s = c_r["Primer"], c_r["Series"]
     sub_c = valid_df[(valid_df["Primer"] == p) & (valid_df["Series"] == s)]
     
-    ntc_val = sub_c[sub_c["Is_NTC"]]["Cq"].mean()
+    ntc_val = sub_c[sub_c["Is_NTC"]]["Cq"].min()  # worst replicate, a mean would hide contamination
     ntc_stat = "Clean" if pd.isna(ntc_val) else (f"Pass ({ntc_val:.1f})" if ntc_val >= 35 else f"High ({ntc_val:.1f})")
 
     valid_c = sub_c[~sub_c["Is_NTC"]].dropna(subset=["Cq"])
@@ -410,12 +422,12 @@ for _, c_r in conditions.iterrows():
         "Optimized Eff (%)": f"{eff_opt:.1f}%" if not np.isnan(eff_opt) else "No Amp",
         "Optimized R²": f"{r2_opt:.4f}" if not np.isnan(r2_opt) else "N/A",
         "Smart recommendation": action,
-        "Status": "🟢 Optimal" if (90 <= eff_opt <= 110 and r2_opt >= 0.98) else "🔴 Suboptimal",
+        "Status": "⚪ No data" if np.isnan(eff_opt) else ("🟢 Optimal" if (90 <= eff_opt <= 110 and r2_opt >= 0.98) else "🔴 Suboptimal"),
         "NTC QC": ntc_stat
     })
 
 sum_table = pd.DataFrame(summary_records)
-st.dataframe(sum_table, use_container_width=True)
+st.dataframe(sum_table, width="stretch")
 
 # Export Buttons with Complete Excel Format (both table & 96-well grid)
 col_dl1, col_dl2 = st.columns(2)
@@ -428,8 +440,8 @@ with col_dl1:
         mime="text/csv"
     )
 with col_dl2:
-    excel_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-    with pd.ExcelWriter(excel_tmp.name, engine="openpyxl") as writer:
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
         sum_table.to_excel(writer, sheet_name="Executive_Summary", index=False)
 
         # Sheet 2: 96-Well Plate Map (Guaranteed 8x12 grid via reindex)
@@ -486,13 +498,12 @@ with col_dl2:
                 max_len = max(len(str(c.value or "")) for c in col)
                 ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len + 3, 12)
 
-    with open(excel_tmp.name, "rb") as ef:
-        st.download_button(
-            f"📊 Download complete Excel ({export_name}_report.xlsx)",
-            data=ef.read(),
-            file_name=f"{export_name}_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    st.download_button(
+        f"📊 Download complete Excel ({export_name}_report.xlsx)",
+        data=excel_buf.getvalue(),
+        file_name=f"{export_name}_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 st.divider()
 
@@ -558,7 +569,7 @@ fig_heat.update_layout(
 fig_heat.update_xaxes(tickmode="linear", tick0=1, dtick=1, title="Column (1 - 12)")
 fig_heat.update_yaxes(tickmode="linear", dtick=1, title="Row (A - H)")
 
-st.plotly_chart(fig_heat, use_container_width=True)
+st.plotly_chart(fig_heat, width="stretch")
 
 st.divider()
 
@@ -570,8 +581,8 @@ col_p_sel, _ = st.columns([2, 3])
 with col_p_sel:
     selected_cond = st.selectbox("Choose primer to inspect:", cond_names)
 
-sel_p, sel_s = selected_cond.split(" ")
-sel_s = sel_s.replace("(", "").replace(")", "")
+sel_row = conditions.iloc[cond_names.index(selected_cond)]
+sel_p, sel_s = sel_row["Primer"], sel_row["Series"]
 cond_data = valid_df[(valid_df["Primer"] == sel_p) & (valid_df["Series"] == sel_s)].copy()
 
 valid_wells_sub = cond_data[~cond_data["Is_NTC"]].dropna(subset=["Cq"])
@@ -631,7 +642,8 @@ eff_delta = f"{eff_live - eff_init:+.1f}% vs baseline" if not np.isnan(eff_init)
 k1.metric("PCR efficiency", f"{eff_live:.2f}%" if not np.isnan(eff_live) else "N/A", delta=eff_delta)
 k2.metric("R-squared (R²)", f"{r2_live:.4f}" if not np.isnan(r2_live) else "N/A")
 k3.metric("Slope", f"{sl_live:.3f}" if not np.isnan(sl_live) else "N/A")
-k4.metric("Live status", "🟢 Optimal" if (90 <= eff_live <= 110 and r2_live >= 0.98) else "🔴 Suboptimal")
+live_status = "⚪ No data" if np.isnan(eff_live) else ("🟢 Optimal" if (90 <= eff_live <= 110 and r2_live >= 0.98) else "🔴 Suboptimal")
+k4.metric("Live status", live_status)
 
 # 3-Panel Plotly Charts
 c_p1, c_p2, c_p3 = st.columns(3)
@@ -652,7 +664,7 @@ with c_p1:
                 f_amp.add_trace(go.Scatter(x=cycles_x, y=amp_df[w].values, mode="lines", name=name,
                                            line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
     f_amp.update_layout(title="Amplification curves", xaxis_title="Cycle", yaxis_title="RFU", height=380, showlegend=False)
-    st.plotly_chart(f_amp, use_container_width=True)
+    st.plotly_chart(f_amp, width="stretch")
 
 # 2. Melt Peaks
 with c_p2:
@@ -670,7 +682,7 @@ with c_p2:
                 f_melt.add_trace(go.Scatter(x=temp_x, y=melt_df[w].values, mode="lines", name=name,
                                             line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
     f_melt.update_layout(title="Melt peaks (-d(RFU)/dT)", xaxis_title="Temp (°C)", yaxis_title="-d(RFU)/dT", height=380, showlegend=False)
-    st.plotly_chart(f_melt, use_container_width=True)
+    st.plotly_chart(f_melt, width="stretch")
 
 # 3. Standard Curve
 with c_p3:
@@ -694,5 +706,6 @@ with c_p3:
         y_line = sl_live * x_line + int_live
         f_std.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", line=dict(color="#C00000", width=2), name="Fit"))
 
-    f_std.update_layout(title=f"Standard curve (Eff={eff_live:.1f}%, R²={r2_live:.3f})", xaxis_title="Log10 rel conc", yaxis_title="Cq", height=380, showlegend=False)
-    st.plotly_chart(f_std, use_container_width=True)
+    std_title = "Standard curve (need ≥ 3 points)" if np.isnan(eff_live) else f"Standard curve (Eff={eff_live:.1f}%, R²={r2_live:.3f})"
+    f_std.update_layout(title=std_title, xaxis_title="Log10 rel conc", yaxis_title="Cq", height=380, showlegend=False)
+    st.plotly_chart(f_std, width="stretch")

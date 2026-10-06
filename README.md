@@ -1,141 +1,163 @@
+<div align="center">
+
 # qPCR Primer Validation
 
-> Open-source standard curve engine and MIQE quality control for real-time PCR.  
-> If Bio-Rad CFX gives you raw numbers, this tool tells you whether your assay actually works.
+**Check whether your primers work, in a couple of clicks.**
+Upload a Bio-Rad CFX run, get PCR efficiency, R², no-template-control status and an interactive plate view.
+
+<br>
+
+<a href="https://qpcr-primer-validation.streamlit.app/">
+  <img src="https://img.shields.io/badge/%E2%96%B6%20%20OPEN%20THE%20APP-qpcr--primer--validation.streamlit.app-1F4E79?style=for-the-badge" alt="Open the app" height="56">
+</a>
+
+<br><br>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io)
-[![Plotly](https://img.shields.io/badge/Plots-Plotly-3F4F75.svg)](https://plotly.com)
 
-https://qpcr-primer-validation.streamlit.app/
-
----
-
-## The 30-Second Workflow
-
-| Step | Action | What Happens Under the Hood |
-|---|---|---|
-| **01** | **Drop the folder or ZIP** | Recursively pairs Bio-Rad CSV exports with your 8×12 `plate.xlsx` layout. |
-| **02** | **Spot the limit (LOQ)** | Detects plateaus where low concentrations hit the noise floor ($C_q$ tailing). |
-| **03** | **Export clean reports** | Real-time reactive curves, MIQE validation metrics, and multi-sheet Excel workbooks. |
+</div>
 
 ---
 
-## Problems It Solves
+## What is this for?
 
-| In the Lab Without This Tool | With This Tool |
+Before you use a primer pair on real samples, you run a **dilution series** (a *standard curve*) and ask:
+
+- Does the product double every cycle? (**PCR efficiency**, ideally 90–110 %)
+- Is the response linear across the dilutions? (**R²**, ideally ≥ 0.98)
+- Is the water control clean? (**NTC**)
+- Is there one specific product? (**melt curve**, one sharp peak)
+
+The Bio-Rad software exports the raw numbers but does not answer these questions. This app does, and lets you see what happens to the curve when you remove a suspicious well.
+
+It is meant for primer **validation**, not for gene-expression analysis (no ΔΔCt).
+
+---
+
+## How to use it
+
+1. **Export from CFX Maestro** the CSV files of your run (see [Input files](#input-files)).
+2. **Fill in a plate layout** in Excel and save it as `plate.xlsx` (see [Plate layout](#plate-layout)).
+3. **Put everything in one folder, zip it** and drop the ZIP into the app.
+
+That's it. You get:
+
+| You see | What it tells you |
 |---|---|
-| ❌ **Invisible detection limits:** Your dilution curve hits 116% efficiency because the 1:10,000 point flattened out. You spend hours wondering why your slope is wrong. | ✅ **Smart LOQ advisor:** Automatically flags when your lowest dilution hits the limit of quantification and simulates the curve without the plateau. |
-| ❌ **Excel formula breakage:** You delete an outlier replicate to see how the curve changes; `=AVERAGE()` throws `#DIV/0!`, infecting `=SLOPE()` and killing the whole sheet. | ✅ **Fault-tolerant calculation:** Native reactive state handles missing wells, zero replicates, or trimmed concentrations without formula errors. |
-| ❌ **Copy-paste naming traps:** Lab technicians write `10x_4` or `10x_16` in 10-fold dilution series. Naive scripts calculate slope against 4-fold factors, yielding bizarre –5.51 slopes. | ✅ **Heuristic dilution parser:** Reconciles biological intent. Handles `1k`, `10k`, metric multipliers, and legacy copy-paste labels automatically. |
-| ❌ **Blind well lookups:** You have to cross-reference row A05 in three different text files to see if the melt peak matches the amplification curve. | ✅ **Unified 8×12 spatial heatmap:** High-contrast 96-well grid view displays actual $C_q$ values inside the wells alongside sample tags. |
+| **Summary table** | Efficiency, R², NTC status and a green / red verdict for every primer |
+| **96-well heatmap** | Cq of every well, so you can spot a missing or odd well at a glance |
+| **Well manager** | Untick a well and the efficiency and R² update instantly |
+| **Three plots** | Amplification curves, melt peaks and the standard curve, per primer |
+| **Downloads** | A summary CSV and an Excel report with the plate map |
+
+> **Try it first:** tick *Load demo synthetic data* in the sidebar to explore the app without any files.
 
 ---
 
-## The Four Pillars
+## How to read the result
 
-```
-                     RAW RUN FILES (*.csv) + plate.xlsx
-                                    │
-                                    ▼
-                        [ AUTO-INGEST ENGINE ]
-             Regex Well Sanitizer · Heuristic Series Resolver
-                                    │
-               ┌────────────────────┴────────────────────┐
-               ▼                                         ▼
-      [ SPATIAL MATRIX ]                        [ LOQ ADVISOR ]
-  8×12 Contrast Cq Heatmap                 Limit of Quantification
-               │                                         │
-               └────────────────────┬────────────────────┘
-                                    ▼
-                        [ INTERACTIVE DASHBOARD ]
-                   Plotly Triple Panel · Live Replicates
-                                    │
-                                    ▼
-                          [ ARTIFACT EXPORT ]
-             Summary CSV · Multi-Sheet Formatted Excel (96-Well)
-```
+| Value | Good | What a bad value usually means |
+|---|---|---|
+| **Efficiency** | 90 – 110 % | < 90 %: inhibition or poorly designed primers. > 110 %: pipetting error, or the most dilute point is beyond the detection limit |
+| **R²** | ≥ 0.98 | Noisy replicates or a point that does not fit |
+| **Slope** | about −3.32 (= 100 %) | Efficiency is calculated as `10^(−1/slope) − 1` |
+| **NTC** | no Cq, or Cq ≥ 35 | Contamination or primer dimers. The app uses the *lowest* NTC Cq, so one dirty replicate is not averaged away |
 
-1. **Ingest Engine** — Zero-config discovery. Drop a raw run directory or ZIP archive. It maps `A1` to `A01`, strips whitespace, and identifies negative controls (NTC) without manual column mapping.
-2. **LOQ Advisor** — Standard curves fail most often because the highest dilution falls below the assay's dynamic range. The advisor calculates both baseline and trimmed models so you see the impact immediately.
-3. **Reactive Replicate Filter** — Toggle individual wells or entire dilution tiers with checkboxes to evaluate pipetting artifacts in real time.
-4. **Spatial Verification** — View the whole plate at a glance. Text contrast auto-adjusts against background fluorescence intensity so $C_q$ numbers remain readable.
+### Detection-limit advisor
+
+If a curve fails, the app checks whether it would pass without the **most dilute point**. A very dilute sample often drifts to the plateau of the assay's detection limit, which pushes efficiency above 100 %. If dropping that point brings the curve into range, the app says so, shows the improved numbers and unticks those wells for you. You can always tick them back.
+
+The advisor only ever considers the single most dilute point. It is a hint, not a verdict: **dropping points must be reported in your methods.**
 
 ---
 
-## What This Tool Is NOT
+## Input files
 
-- **Not a $\Delta\Delta C_T$ expression differential calculator.** It evaluates primer pairs and assay efficiency *before* you run experimental biological samples.
-- **Not a cloud SaaS.** 100% local execution. No biological sequence metadata, primer names, or thermocycler files leave your machine.
-- **Not an instrument-locked vendor utility.** Reads open tabular outputs, allowing cross-platform evaluation regardless of software licensing.
+Export these from the Bio-Rad CFX software as CSV. The app finds them by name, anywhere inside the folder or ZIP:
 
----
+| File (name contains) | Required | Used for |
+|---|---|---|
+| `Quantification Cq Results` | yes | Cq of each well |
+| `Quantification Amplification Results` | no | Amplification curves |
+| `Melt Curve Derivative Results` | no | Melt peaks |
+| `plate.xlsx` | yes | Which primer and dilution is in which well |
 
-## Quickstart
-
-### 1. Installation
-
-```bash
-git clone https://github.com/pavrostiva/qpcr_primer_validation.git
-cd qpcr_primer_validation
-
-pip install streamlit plotly pandas numpy scipy openpyxl
-```
-
-### 2. Launch
-
-```bash
-streamlit run app.py
-```
-
-The browser UI will open at `http://localhost:8501`.
-
-### 3. Try with Synthetic Demo Data
-Check **`🧪 Load demo synthetic data`** in the sidebar.  
-The tool will synthesize an in-memory 96-well run with amplification kinetics, Gaussian melt peaks, and an intentional LOQ plateau to demonstrate live outlier handling.
-
----
-
-## Input Expectations
-
-The app looks for files matching standard Bio-Rad CFX export patterns:
+A run folder looks like this:
 
 ```
-my_run_folder/
+my_run/
 ├── my_run - Quantification Cq Results.csv
 ├── my_run - Quantification Amplification Results_SYBR.csv
 ├── my_run - Melt Curve Derivative Results_SYBR.csv
 └── plate.xlsx
 ```
 
-### Layout Spreadsheet (`plate.xlsx`)
-An 8×12 grid with rows labeled **A–H** and columns **1–12**. Cells use the standard notation:  
-`{Primer}_{Series}_{Dilution}`
+Other files in the folder (Run Information, End Point, etc.) are ignored.
+
+### Plate layout
+
+An Excel sheet with rows **A–H** in the first column and columns **1–12** across. Each cell is one tag:
+
+```
+Primer_Series_Dilution
+```
 
 | | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|
-| **A** | `Actin_4x_1` | `Actin_4x_16` | `GeneX_10x_1` | `GeneX_10x_100` |
-| **B** | `Actin_4x_1` | `Actin_4x_64` | `GeneX_10x_1` | `GeneX_10x_1k` |
-| ... | ... | ... | ... | ... |
-| **H** | `Actin_4x_16` | `Actin_4x_NTC` | `GeneX_10x_100` | `GeneX_10x_NTC` |
+| **A** | `H1_10x_1` | `H1_10x_100` | `M1_10x_1` | `M1_10x_100` |
+| **B** | `H1_10x_1` | `H1_10x_1k` | `M1_10x_1` | `M1_10x_1k` |
+| **C** | `H1_10x_10` | `H1_10x_10k` | `M1_10x_10` | `M1_10x_10k` |
+| **D** | `H1_10x_100` | `H1_10x_NTC` | `M1_10x_100` | `M1_10x_NTC` |
 
-- `NTC` tags are routed to negative control evaluation (alerted if $C_q < 35$).
-- Metric abbreviations (`1k` $\to$ 1,000, `10k` $\to$ 10,000) parse automatically.
+- **Primer**: any name; it may contain underscores (`GAPDH_human_10x_100`).
+- **Series**: a label for the dilution series, for example `10x` or `4x`. One primer can have several series, and each is evaluated separately.
+- **Dilution**: the dilution factor as a number (`1`, `10`, `100`) or with a suffix (`1k` = 1000, `10k` = 10 000).
+- **`NTC`** in the dilution position marks a no-template control.
+- **Leave unused wells empty.** A partly filled plate is fine, and replicates can be anywhere on the plate; wells are grouped by tag, not by position.
+- If a tag cannot be read, the app lists it in a warning instead of silently skipping it.
+
+**A note on copy-pasted labels.** If a series is called `10x` but the dilutions are written `1, 4, 16, 64, 256` (copied from a 4-fold series), the app reads them as `1, 10, 100, 1000, 10000`. Without this the slope would be calculated against the wrong dilution factors (−5.5 instead of −3.3). Please still check your layout.
+
+---
+
+## Run it on your own computer
+
+The hosted app is convenient, but it runs on Streamlit Community Cloud. If your data is confidential, run the app locally; then nothing leaves your machine.
+
+```bash
+git clone https://github.com/pavrostiva/qpcr_primer_validation.git
+cd qpcr_primer_validation
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+The app opens at `http://localhost:8501`. Locally you can also point it at a folder instead of uploading a ZIP.
 
 ---
 
-## Generated Artifacts
+## Output files
 
-Exports automatically inherit the directory or archive name (e.g., `2026-09-24_qPCR_...`):
+Names start with the name of your ZIP or folder.
 
-- **`*_summary.csv`** — Executive table pairing raw metrics against LOQ-adjusted values (Slope, Efficiency %, $R^2$, NTC pass/fail).
-- **`*_report.xlsx`** — Complete Excel package:
-  - `Executive_Summary` — Compact summary matrix.
-  - `Plate_96_Map` — Visual 8×12 grids containing both user sample tags and instrument $C_q$ values.
-  - `Raw_Wells` — Flat auditing table linking every well to its kinetic values.
+- **`…_summary.csv`**: one row per primer and series: raw and optimized efficiency, R², recommendation, status and NTC check.
+- **`…_report.xlsx`**: three sheets: `Executive_Summary`, `Plate_96_Map` (your layout and the Cq values as 8×12 grids) and `Raw_Wells` (one row per well).
+
+The exports contain the *automatic* recommendation. Wells you untick by hand in the well manager affect the on-screen numbers only, so note them down.
 
 ---
+
+## Limitations
+
+- Bio-Rad CFX exports only. Other instruments need a different file parser.
+- SYBR-style single-channel runs. Multi-channel (e.g. FAM + HEX) runs are not supported.
+- Efficiency and R² are calculated on the mean Cq of each dilution, with at least 3 dilutions required. MIQE recommends 5 points over at least 3 orders of magnitude, which is worth keeping in mind when you design the series.
+- The melt curve is for you to inspect; the app does not judge it automatically.
+
+## Validation
+
+On the same data, the slopes and efficiencies match the published tool Auto-qPCR to two decimals (for example slope −3.32, efficiency 100.15 % for one primer pair).
 
 ## License
 
