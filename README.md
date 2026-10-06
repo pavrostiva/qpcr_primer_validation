@@ -48,9 +48,9 @@ That's it. You get:
 |---|---|
 | **Summary table** | Efficiency, R², NTC status and a green / red verdict for every primer |
 | **96-well heatmap** | Cq of every well, so you can spot a missing or odd well at a glance |
-| **Well manager** | Untick a well and the efficiency and R² update instantly |
+| **Well manager** | Every primer is shown on one page; untick a well and its efficiency and R² update instantly |
 | **Three plots** | Amplification curves, melt peaks and the standard curve, per primer |
-| **Downloads** | A summary CSV and an Excel report with the plate map |
+| **Downloads** | A PDF report (one page per primer) and an Excel report with the plate map |
 
 > **Try it first:** tick *Load demo synthetic data* in the sidebar to explore the app without any files.
 
@@ -139,12 +139,12 @@ The app opens at `http://localhost:8501`. Locally you can also point it at a fol
 
 ## Output files
 
-Names start with the name of your ZIP or folder.
+Names start with the name of your ZIP or folder. Both reports follow the wells you have ticked in the well manager.
 
-- **`…_summary.csv`**: one row per primer and series: raw and optimized efficiency, R², recommendation, status and NTC check.
-- **`…_report.xlsx`**: three sheets: `Executive_Summary`, `Plate_96_Map` (your layout and the Cq values as 8×12 grids) and `Raw_Wells` (one row per well).
+- **`…_report.pdf`**: click *Build PDF report*, then *Download PDF*. Page 1 has the summary table and the 96-well plate. Then there is one landscape page per primer with efficiency, R², slope, NTC, amplification curves, melt peaks, the standard curve and a table of every well (excluded wells are struck through).
+- **`…_report.xlsx`**: `Executive_Summary`, `Plate_96_Map` (your layout and the Cq values as 8×12 grids) and `Raw_Wells` (one row per well, with an `Included_in_fit` column).
 
-The exports contain the *automatic* recommendation. Wells you untick by hand in the well manager affect the on-screen numbers only, so note them down.
+If you change a tick after building the PDF, build it again.
 
 ---
 
@@ -157,7 +157,7 @@ The exports contain the *automatic* recommendation. Wells you untick by hand in 
 
 ## Validation
 
-On the same data, the slopes and efficiencies match the published tool Auto-qPCR to two decimals (for example slope −3.32, efficiency 100.15 % for one primer pair).
+On the same data, the slopes and efficiencies match the published tool [Auto-qPCR](https://github.com/neuroeddu/Auto-qPCR) to two decimals (for example slope −3.32, efficiency 100.15 % for one primer pair).
 
 ## License
 

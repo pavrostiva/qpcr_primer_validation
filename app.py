@@ -13,6 +13,8 @@ import plotly.graph_objects as go
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+from pdf_report import build_pdf_report
+
 st.set_page_config(
     page_title="qPCR primer validation",
     page_icon="🧬",
@@ -380,6 +382,8 @@ st.caption(f"Layout source: `{layout_name}` | Rows: 8 (A-H) | Columns: 12 (1-12)
 
 # Filter out empty wells from all downstream statistics
 valid_df = merged_df[~merged_df["Is_Empty"] & (merged_df["Primer"] != "Empty")].copy()
+# Wells whose dilution could not be read were already reported above; keep them out of the analysis
+valid_df = valid_df[valid_df["Is_NTC"] | valid_df["Dilution_Factor"].notna()]
 
 if valid_df.empty:
     st.warning("⚠️ No valid primer targets detected on the plate.")
@@ -387,122 +391,191 @@ if valid_df.empty:
 
 conditions = valid_df[["Primer", "Series"]].drop_duplicates().sort_values(by=["Primer", "Series"])
 
+# ----------------- ANALYSIS: every primer, honouring the well checkboxes -----------------
+
+def is_optimal(eff, r2) -> bool:
+    return not (np.isnan(eff) or np.isnan(r2)) and 90 <= eff <= 110 and r2 >= 0.98
+
+
+def status_of(eff, r2) -> str:
+    if np.isnan(eff) or np.isnan(r2):
+        return "NO DATA"
+    return "OPTIMAL" if is_optimal(eff, r2) else "SUBOPTIMAL"
+
+
+STATUS_ICON = {"OPTIMAL": "🟢 Optimal", "SUBOPTIMAL": "🔴 Suboptimal", "NO DATA": "⚪ No data"}
+
+
+def fit_points(wells: pd.DataFrame):
+    """Mean Cq per dilution, then regression: (grouped, slope, intercept, r2, eff)."""
+    grp = wells.groupby("Dilution_Factor")["Cq"].agg(["mean", "std", "count"]).reset_index()
+    if len(grp) >= 3:
+        return (grp, *calc_stats(-np.log10(grp["Dilution_Factor"].values), grp["mean"].values))
+    return grp, np.nan, np.nan, np.nan, np.nan
+
+
+def well_key(well: str) -> str:
+    return f"w_chk_{run_name}_{well}"
+
+
+def analyze_condition(primer: str, series: str) -> dict:
+    sub = valid_df[(valid_df["Primer"] == primer) & (valid_df["Series"] == series)]
+    ntc = sub[sub["Is_NTC"]].sort_values("Well")
+    std = sub[~sub["Is_NTC"]].dropna(subset=["Cq"]).sort_values(["Dilution_Factor", "Well"]).copy()
+    n_no_cq = int((~sub["Is_NTC"] & sub["Cq"].isna()).sum())
+
+    # All wells included
+    grp_raw, _, _, r2_raw, eff_raw = fit_points(std)
+
+    # Smart LOQ advisor: does the curve pass without the most dilute point?
+    rec_factor, advice = None, ""
+    if not np.isnan(eff_raw) and not is_optimal(eff_raw, r2_raw):
+        trimmed = grp_raw.iloc[:-1]
+        if len(trimmed) >= 3:
+            _, _, r2_t, eff_t = calc_stats(-np.log10(trimmed["Dilution_Factor"].values), trimmed["mean"].values)
+            if is_optimal(eff_t, r2_t):
+                rec_factor = grp_raw.iloc[-1]["Dilution_Factor"]
+                advice = (f"Smart advice: dilution {format_dilution(rec_factor)} reached the limit of quantification (plateau). "
+                          f"Excluding it gives Eff {eff_t:.1f}% and R² {r2_t:.4f}.")
+
+    # Current selection: checkbox state, defaulting to the advisor's recommendation
+    std["Active"] = [
+        st.session_state.get(well_key(w), not (rec_factor is not None and f == rec_factor))
+        for w, f in zip(std["Well"], std["Dilution_Factor"])
+    ]
+    std["Active"] = std["Active"].astype(bool)  # an empty list would give object dtype and break masking
+    grp_sel, slope, intercept, r2, eff = fit_points(std[std["Active"]])
+
+    ntc_min = ntc["Cq"].min()  # worst replicate; a mean would hide contamination
+    if pd.isna(ntc_min):
+        ntc_label = "Clean" if not ntc.empty else "No NTC"
+    else:
+        ntc_label = f"Pass ({ntc_min:.1f})" if ntc_min >= 35 else f"High ({ntc_min:.1f})"
+
+    return {
+        "primer": primer, "series": series, "std": std, "ntc": ntc, "n_no_cq": n_no_cq,
+        "eff_raw": eff_raw, "r2_raw": r2_raw, "grp_sel": grp_sel,
+        "slope": slope, "intercept": intercept, "r2": r2, "eff": eff,
+        "status": status_of(eff, r2), "ntc_label": ntc_label,
+        "rec_factor": rec_factor, "advice": advice,
+        "recommendation": f"Exclude {format_dilution(rec_factor)} (plateau/LOQ)" if rec_factor is not None else "Keep as-is",
+        "n_active": int(std["Active"].sum()), "n_total": len(std),
+        "excluded_wells": list(std.loc[~std["Active"], "Well"]),
+    }
+
+
+results = [analyze_condition(r["Primer"], r["Series"]) for _, r in conditions.iterrows()]
+
 # ----------------- SECTION 1: EXECUTIVE SUMMARY -----------------
-st.markdown("### 📊 Executive summary & recommendations")
+st.markdown("### 📊 Executive summary")
+st.caption("All primers are analysed at once. Wells you untick below are reflected here, in the PDF and in the Excel report.")
 
-summary_records = []
-for _, c_r in conditions.iterrows():
-    p, s = c_r["Primer"], c_r["Series"]
-    sub_c = valid_df[(valid_df["Primer"] == p) & (valid_df["Series"] == s)]
-    
-    ntc_val = sub_c[sub_c["Is_NTC"]]["Cq"].min()  # worst replicate, a mean would hide contamination
-    ntc_stat = "Clean" if pd.isna(ntc_val) else (f"Pass ({ntc_val:.1f})" if ntc_val >= 35 else f"High ({ntc_val:.1f})")
+sum_table = pd.DataFrame([{
+    "Primer": r["primer"],
+    "Series": r["series"],
+    "Raw Eff (%)": f"{r['eff_raw']:.1f}%" if not np.isnan(r["eff_raw"]) else "No Amp",
+    "Raw R²": f"{r['r2_raw']:.4f}" if not np.isnan(r["r2_raw"]) else "N/A",
+    "Eff (%)": f"{r['eff']:.1f}%" if not np.isnan(r["eff"]) else "No Amp",
+    "R²": f"{r['r2']:.4f}" if not np.isnan(r["r2"]) else "N/A",
+    "Slope": f"{r['slope']:.3f}" if not np.isnan(r["slope"]) else "N/A",
+    "Wells used": f"{r['n_active']}/{r['n_total']}",
+    "Smart recommendation": r["recommendation"],
+    "Status": STATUS_ICON[r["status"]],
+    "NTC QC": r["ntc_label"],
+} for r in results])
+st.dataframe(sum_table, width="stretch", hide_index=True)
 
-    valid_c = sub_c[~sub_c["Is_NTC"]].dropna(subset=["Cq"])
-    g_c = valid_c.groupby("Dilution_Factor")["Cq"].mean().reset_index()
-
-    s_raw, _, r2_raw, eff_raw = calc_stats(-np.log10(g_c["Dilution_Factor"].values), g_c["Cq"].values) if len(g_c) >= 3 else (np.nan, np.nan, np.nan, np.nan)
-
-    # Smart LOQ check
-    action = "Keep as-is"
-    s_opt, r2_opt, eff_opt = s_raw, r2_raw, eff_raw
-    if not np.isnan(eff_raw) and not (90 <= eff_raw <= 110 and r2_raw >= 0.98):
-        g_trim = g_c.iloc[:-1]
-        if len(g_trim) >= 3:
-            s_t, _, r2_t, eff_t = calc_stats(-np.log10(g_trim["Dilution_Factor"].values), g_trim["Cq"].values)
-            if 90 <= eff_t <= 110 and r2_t >= 0.98:
-                action = f"Exclude {format_dilution(g_c.iloc[-1]['Dilution_Factor'])} (plateau/LOQ)"
-                s_opt, r2_opt, eff_opt = s_t, r2_t, eff_t
-
-    summary_records.append({
-        "Primer": p,
-        "Series": s,
-        "Raw Eff (%)": f"{eff_raw:.1f}%" if not np.isnan(eff_raw) else "No Amp",
-        "Raw R²": f"{r2_raw:.4f}" if not np.isnan(r2_raw) else "N/A",
-        "Optimized Eff (%)": f"{eff_opt:.1f}%" if not np.isnan(eff_opt) else "No Amp",
-        "Optimized R²": f"{r2_opt:.4f}" if not np.isnan(r2_opt) else "N/A",
-        "Smart recommendation": action,
-        "Status": "⚪ No data" if np.isnan(eff_opt) else ("🟢 Optimal" if (90 <= eff_opt <= 110 and r2_opt >= 0.98) else "🔴 Suboptimal"),
-        "NTC QC": ntc_stat
-    })
-
-sum_table = pd.DataFrame(summary_records)
-st.dataframe(sum_table, width="stretch")
-
-# Export Buttons with Complete Excel Format (both table & 96-well grid)
-col_dl1, col_dl2 = st.columns(2)
+# Downloads: PDF (built on demand, it takes a few seconds) and Excel
+selection_sig = (run_name, tuple((w, bool(a)) for r in results for w, a in zip(r["std"]["Well"], r["std"]["Active"])))
 export_name = f"{run_name}_qPCR"
-with col_dl1:
-    st.download_button(
-        f"📥 Download summary CSV ({export_name}_summary.csv)",
-        data=sum_table.to_csv(index=False),
-        file_name=f"{export_name}_summary.csv",
-        mime="text/csv"
-    )
-with col_dl2:
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        sum_table.to_excel(writer, sheet_name="Executive_Summary", index=False)
+col_pdf, col_pdf_dl, col_xls = st.columns(3)
 
-        # Sheet 2: 96-Well Plate Map (Guaranteed 8x12 grid via reindex)
-        ws_plate = writer.book.create_sheet(title="Plate_96_Map")
-        rows_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
-        cols_numbers = list(range(1, 13))
+with col_pdf:
+    if st.button("📄 Build PDF report", width="stretch"):
+        with st.spinner("Rendering the PDF (plots for every primer)..."):
+            st.session_state["pdf_report"] = (
+                selection_sig,
+                build_pdf_report(run_name, layout_name, merged_df, results, amp_df, melt_df),
+            )
 
-        plate_cq_grid = merged_df.pivot(index="Row", columns="Col", values="Cq").reindex(index=rows_letters, columns=cols_numbers)
-        plate_tag_grid = merged_df.pivot(index="Row", columns="Col", values="Tag").reindex(index=rows_letters, columns=cols_numbers)
+pdf_state = st.session_state.get("pdf_report")
+with col_pdf_dl:
+    if pdf_state and pdf_state[0] == selection_sig:
+        st.download_button(
+            "⬇️ Download PDF", data=pdf_state[1], file_name=f"{export_name}_report.pdf",
+            mime="application/pdf", width="stretch",
+        )
+    elif pdf_state:
+        st.caption("Selection changed since the last build. Build the PDF again.")
 
-        hdr_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-        hdr_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        sec_font = Font(name="Calibri", size=12, bold=True, color="1F497D")
-        border = Border(left=Side(style="thin", color="D3D3D3"), right=Side(style="thin", color="D3D3D3"),
-                        top=Side(style="thin", color="D3D3D3"), bottom=Side(style="thin", color="D3D3D3"))
+included = {w for r in results for w in r["std"].loc[r["std"]["Active"], "Well"]}
+wells_out = merged_df[["Well", "Row", "Col", "Primer", "Series", "Tag", "Cq", "Is_NTC", "Is_Empty"]].copy()
+wells_out["Included_in_fit"] = [
+    "" if (ntc or emp) else ("yes" if w in included else "no")
+    for w, ntc, emp in zip(wells_out["Well"], wells_out["Is_NTC"], wells_out["Is_Empty"])
+]
 
-        # 1. Layout Map
-        ws_plate["A1"] = "1. Plate layout map (primers & dilutions):"
-        ws_plate["A1"].font = sec_font
-        for c in range(1, 13):
-            cell = ws_plate.cell(row=3, column=c + 1, value=c)
-            cell.fill = hdr_fill; cell.font = hdr_font; cell.alignment = Alignment(horizontal="center")
-        for r_idx, r_let in enumerate(rows_letters, start=4):
-            ws_plate.cell(row=r_idx, column=1, value=r_let).font = Font(bold=True)
-            for c_idx in range(1, 13):
-                tag_val = plate_tag_grid.loc[r_let, c_idx]
-                cell = ws_plate.cell(row=r_idx, column=c_idx + 1, value="" if pd.isna(tag_val) or tag_val == "Empty" else str(tag_val))
-                cell.border = border; cell.alignment = Alignment(horizontal="center")
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    sum_table.to_excel(writer, sheet_name="Executive_Summary", index=False)
 
-        # 2. Cq Map
-        ws_plate["A15"] = "2. Bio-Rad instrument Cq values:"
-        ws_plate["A15"].font = sec_font
-        for c in range(1, 13):
-            cell = ws_plate.cell(row=17, column=c + 1, value=c)
-            cell.fill = hdr_fill; cell.font = hdr_font; cell.alignment = Alignment(horizontal="center")
-        for r_idx, r_let in enumerate(rows_letters, start=18):
-            ws_plate.cell(row=r_idx, column=1, value=r_let).font = Font(bold=True)
-            for c_idx in range(1, 13):
-                val = plate_cq_grid.loc[r_let, c_idx]
-                cell = ws_plate.cell(row=r_idx, column=c_idx + 1)
-                cell.border = border; cell.alignment = Alignment(horizontal="center")
-                if pd.isna(val):
+    # Sheet 2: 96-well plate map (guaranteed 8x12 grid via reindex)
+    ws_plate = writer.book.create_sheet(title="Plate_96_Map")
+    rows_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    cols_numbers = list(range(1, 13))
+
+    plate_cq_grid = merged_df.pivot(index="Row", columns="Col", values="Cq").reindex(index=rows_letters, columns=cols_numbers)
+    plate_tag_grid = merged_df.pivot(index="Row", columns="Col", values="Tag").reindex(index=rows_letters, columns=cols_numbers)
+
+    hdr_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+    hdr_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    sec_font = Font(name="Calibri", size=12, bold=True, color="1F497D")
+    border = Border(left=Side(style="thin", color="D3D3D3"), right=Side(style="thin", color="D3D3D3"),
+                    top=Side(style="thin", color="D3D3D3"), bottom=Side(style="thin", color="D3D3D3"))
+
+    ws_plate["A1"] = "1. Plate layout map (primers & dilutions):"
+    ws_plate["A1"].font = sec_font
+    for c in range(1, 13):
+        cell = ws_plate.cell(row=3, column=c + 1, value=c)
+        cell.fill = hdr_fill; cell.font = hdr_font; cell.alignment = Alignment(horizontal="center")
+    for r_idx, r_let in enumerate(rows_letters, start=4):
+        ws_plate.cell(row=r_idx, column=1, value=r_let).font = Font(bold=True)
+        for c_idx in range(1, 13):
+            tag_val = plate_tag_grid.loc[r_let, c_idx]
+            cell = ws_plate.cell(row=r_idx, column=c_idx + 1, value="" if pd.isna(tag_val) or tag_val == "Empty" else str(tag_val))
+            cell.border = border; cell.alignment = Alignment(horizontal="center")
+
+    ws_plate["A15"] = "2. Bio-Rad instrument Cq values:"
+    ws_plate["A15"].font = sec_font
+    for c in range(1, 13):
+        cell = ws_plate.cell(row=17, column=c + 1, value=c)
+        cell.fill = hdr_fill; cell.font = hdr_font; cell.alignment = Alignment(horizontal="center")
+    for r_idx, r_let in enumerate(rows_letters, start=18):
+        ws_plate.cell(row=r_idx, column=1, value=r_let).font = Font(bold=True)
+        for c_idx in range(1, 13):
+            val = plate_cq_grid.loc[r_let, c_idx]
+            tag_val = plate_tag_grid.loc[r_let, c_idx]
+            cell = ws_plate.cell(row=r_idx, column=c_idx + 1)
+            cell.border = border; cell.alignment = Alignment(horizontal="center")
+            if pd.isna(val):
+                if not (pd.isna(tag_val) or tag_val == "Empty"):
                     cell.value = "No Cq"
                     cell.font = Font(color="808080", italic=True)
-                else:
-                    cell.value = round(val, 2)
-                    cell.number_format = "0.00"
+            else:
+                cell.value = round(val, 2)
+                cell.number_format = "0.00"
 
-        # Sheet 3: Raw Wells
-        merged_df[["Well", "Row", "Col", "Primer", "Series", "Tag", "Cq", "Is_NTC", "Is_Empty"]].to_excel(writer, sheet_name="Raw_Wells", index=False)
+    wells_out.to_excel(writer, sheet_name="Raw_Wells", index=False)
 
-        for ws in [writer.sheets["Executive_Summary"], writer.sheets["Plate_96_Map"], writer.sheets["Raw_Wells"]]:
-            for col in ws.columns:
-                max_len = max(len(str(c.value or "")) for c in col)
-                ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len + 3, 12)
+    for ws in [writer.sheets["Executive_Summary"], writer.sheets["Plate_96_Map"], writer.sheets["Raw_Wells"]]:
+        for col in ws.columns:
+            max_len = max(len(str(c.value or "")) for c in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len + 3, 12)
 
+with col_xls:
     st.download_button(
-        f"📊 Download complete Excel ({export_name}_report.xlsx)",
-        data=excel_buf.getvalue(),
-        file_name=f"{export_name}_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "📊 Download Excel report", data=excel_buf.getvalue(), file_name=f"{export_name}_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
     )
 
 st.divider()
@@ -573,139 +646,91 @@ st.plotly_chart(fig_heat, width="stretch")
 
 st.divider()
 
-# ----------------- SECTION 3: DETAILED PRIMER INSPECTOR -----------------
-st.markdown("### 🔍 Detailed primer inspector & interactive optimizer")
+# ----------------- SECTION 3: ALL PRIMERS, ONE AFTER ANOTHER -----------------
+st.markdown("### 🔍 Primer details & well manager")
+st.caption("Every primer is shown below. Untick a replicate to exclude it; numbers, plots, PDF and Excel update.")
 
-cond_names = [f"{r['Primer']} ({r['Series']})" for _, r in conditions.iterrows()]
-col_p_sel, _ = st.columns([2, 3])
-with col_p_sel:
-    selected_cond = st.selectbox("Choose primer to inspect:", cond_names)
+for res in results:
+    primer, series = res["primer"], res["series"]
+    std = res["std"]
+    cond_data = valid_df[(valid_df["Primer"] == primer) & (valid_df["Series"] == series)]
+    active_wells = set(std.loc[std["Active"], "Well"])
+    k = f"{primer}_{series}"
 
-sel_row = conditions.iloc[cond_names.index(selected_cond)]
-sel_p, sel_s = sel_row["Primer"], sel_row["Series"]
-cond_data = valid_df[(valid_df["Primer"] == sel_p) & (valid_df["Series"] == sel_s)].copy()
+    with st.container(border=True):
+        st.markdown(f"#### {primer} ({series})")
 
-valid_wells_sub = cond_data[~cond_data["Is_NTC"]].dropna(subset=["Cq"])
-grp_pts = valid_wells_sub.groupby("Dilution_Factor")["Cq"].mean().reset_index()
+        if std.empty:
+            st.error("No Cq values for this primer: no amplification detected in any sample well.")
+        elif res["rec_factor"] is not None:
+            st.warning("💡 " + res["advice"] + " Those wells are unticked by default; tick them back if you disagree.")
+        elif res["status"] == "OPTIMAL":
+            st.success("✅ Standard curve satisfies the guidelines (Eff 90-110%, R² >= 0.98).")
+        elif res["status"] == "NO DATA":
+            st.info("Fewer than 3 dilution points selected: no standard curve can be fitted.")
+        else:
+            st.error("Standard curve is outside the guidelines (Eff 90-110%, R² >= 0.98) and removing the last dilution does not fix it.")
 
-s_init, int_init, r2_init, eff_init = calc_stats(-np.log10(grp_pts["Dilution_Factor"].values), grp_pts["Cq"].values) if len(grp_pts) >= 3 else (np.nan, np.nan, np.nan, np.nan)
+        if res["n_no_cq"]:
+            st.caption(f"⚠️ {res['n_no_cq']} sample well(s) have no Cq.")
 
-# Smart recommendation
-adv_msg = "Data fits optimal criteria."
-rec_drop = None
-if not np.isnan(eff_init) and not (90 <= eff_init <= 110 and r2_init >= 0.98):
-    g_trim = grp_pts.iloc[:-1]
-    if len(g_trim) >= 3:
-        st_i, _, r2t_i, efft_i = calc_stats(-np.log10(g_trim["Dilution_Factor"].values), g_trim["Cq"].values)
-        if 90 <= efft_i <= 110 and r2t_i >= 0.98:
-            rec_drop = g_trim.iloc[-1]["Dilution_Factor"]
-            adv_msg = f"💡 **Smart advice:** Dilution {format_dilution(grp_pts.iloc[-1]['Dilution_Factor'])} reached the limit of quantification (plateau). Excluding it yields **Eff: {efft_i:.1f}%** and **R²: {r2t_i:.4f}** (optimal!)."
+        with st.expander("🛠️ Interactive well manager (toggle replicates)", expanded=True):
+            st.write("Uncheck any replicate or dilution point to observe real-time recalculation:")
+            chk_cols = st.columns(5)
+            for i, (_, w_row) in enumerate(std.iterrows()):
+                chk_cols[i % 5].checkbox(
+                    f"{w_row['Well']} ({format_dilution(w_row['Dilution_Factor'])}): Cq={w_row['Cq']:.2f}",
+                    value=bool(w_row["Active"]),
+                    key=well_key(w_row["Well"]),
+                )
 
-if rec_drop is not None:
-    st.warning(adv_msg)
-else:
-    st.success("✅ Standard curve satisfies standard guidelines (Eff 90-110%, R² >= 0.98).")
+        eff_delta = (f"{res['eff'] - res['eff_raw']:+.1f}% vs baseline"
+                     if not np.isnan(res["eff_raw"]) and not np.isnan(res["eff"]) and res["n_active"] != res["n_total"] else None)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("PCR efficiency", f"{res['eff']:.2f}%" if not np.isnan(res["eff"]) else "N/A", delta=eff_delta)
+        k2.metric("R-squared (R²)", f"{res['r2']:.4f}" if not np.isnan(res["r2"]) else "N/A")
+        k3.metric("Slope", f"{res['slope']:.3f}" if not np.isnan(res["slope"]) else "N/A")
+        k4.metric("Live status", STATUS_ICON[res["status"]])
 
-# Interactive Well Manager (OPEN BY DEFAULT)
-with st.expander("🛠️ Interactive well manager (toggle replicates)", expanded=True):
-    st.write("Uncheck any replicate or dilution point to observe real-time recalculation:")
-    chk_cols = st.columns(5)
-    active_well_list = []
-    for i, (_, w_row) in enumerate(valid_wells_sub.iterrows()):
-        col_c = chk_cols[i % 5]
-        def_val = True
-        if rec_drop is not None and w_row["Dilution_Factor"] == grp_pts.iloc[-1]["Dilution_Factor"]:
-            def_val = False  # Auto uncheck recommended outlier
+        c_p1, c_p2, c_p3 = st.columns(3)
+        for col, df_, xcol, key, color, title, xt, yt in (
+            (c_p1, amp_df, "Cycle", "amp", "#1f77b4", "Amplification curves", "Cycle", "RFU"),
+            (c_p2, melt_df, "Temperature", "melt", "#2ca02c", "Melt peaks (-d(RFU)/dT)", "Temp (°C)", "-d(RFU)/dT"),
+        ):
+            with col:
+                fig = go.Figure()
+                if df_ is not None and xcol in df_.columns:
+                    for _, w_r in cond_data.iterrows():
+                        w = w_r["Well"]
+                        if w in df_.columns:
+                            is_ntc, is_active = w_r["Is_NTC"], w in active_wells
+                            name = "NTC" if is_ntc else f"{format_dilution(w_r['Dilution_Factor'])} ({w})"
+                            fig.add_trace(go.Scatter(
+                                x=df_[xcol].values, y=df_[w].values, mode="lines", name=name,
+                                line=dict(color="red" if is_ntc else (color if is_active else "#dddddd"),
+                                          dash="dash" if is_ntc else "solid",
+                                          width=1.5 if is_active or is_ntc else 0.8)))
+                fig.update_layout(title=title, xaxis_title=xt, yaxis_title=yt, height=380, showlegend=False)
+                st.plotly_chart(fig, width="stretch", key=f"{key}_{k}")
 
-        is_checked = col_c.checkbox(
-            f"{w_row['Well']} ({format_dilution(w_row['Dilution_Factor'])}): Cq={w_row['Cq']:.2f}",
-            value=def_val,
-            key=f"w_chk_{w_row['Well']}"
-        )
-        if is_checked:
-            active_well_list.append(w_row["Well"])
-
-# Live Calculation
-filtered_pts = valid_wells_sub[valid_wells_sub["Well"].isin(active_well_list)]
-filtered_grp = filtered_pts.groupby("Dilution_Factor")["Cq"].agg(["mean", "std", "count"]).reset_index()
-
-sl_live, int_live, r2_live, eff_live = np.nan, np.nan, np.nan, np.nan
-if len(filtered_grp) >= 3:
-    act_x = -np.log10(filtered_grp["Dilution_Factor"].values)
-    act_y = filtered_grp["mean"].values
-    sl_live, int_live, r2_live, eff_live = calc_stats(act_x, act_y)
-
-# KPI Cards with neat delta
-k1, k2, k3, k4 = st.columns(4)
-eff_delta = f"{eff_live - eff_init:+.1f}% vs baseline" if not np.isnan(eff_init) and not np.isnan(eff_live) else None
-
-k1.metric("PCR efficiency", f"{eff_live:.2f}%" if not np.isnan(eff_live) else "N/A", delta=eff_delta)
-k2.metric("R-squared (R²)", f"{r2_live:.4f}" if not np.isnan(r2_live) else "N/A")
-k3.metric("Slope", f"{sl_live:.3f}" if not np.isnan(sl_live) else "N/A")
-live_status = "⚪ No data" if np.isnan(eff_live) else ("🟢 Optimal" if (90 <= eff_live <= 110 and r2_live >= 0.98) else "🔴 Suboptimal")
-k4.metric("Live status", live_status)
-
-# 3-Panel Plotly Charts
-c_p1, c_p2, c_p3 = st.columns(3)
-
-# 1. Amplification
-with c_p1:
-    f_amp = go.Figure()
-    if amp_df is not None:
-        cycles_x = amp_df["Cycle"].values
-        for _, w_r in cond_data.iterrows():
-            w = w_r["Well"]
-            if w in amp_df.columns:
-                is_ntc = w_r["Is_NTC"]
-                is_active = w in active_well_list
-                col = "red" if is_ntc else ("#1f77b4" if is_active else "#dddddd")
-                dash = "dash" if is_ntc else "solid"
-                name = "NTC" if is_ntc else f"{format_dilution(w_r['Dilution_Factor'])} ({w})"
-                f_amp.add_trace(go.Scatter(x=cycles_x, y=amp_df[w].values, mode="lines", name=name,
-                                           line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
-    f_amp.update_layout(title="Amplification curves", xaxis_title="Cycle", yaxis_title="RFU", height=380, showlegend=False)
-    st.plotly_chart(f_amp, width="stretch")
-
-# 2. Melt Peaks
-with c_p2:
-    f_melt = go.Figure()
-    if melt_df is not None:
-        temp_x = melt_df["Temperature"].values
-        for _, w_r in cond_data.iterrows():
-            w = w_r["Well"]
-            if w in melt_df.columns:
-                is_ntc = w_r["Is_NTC"]
-                is_active = w in active_well_list
-                col = "red" if is_ntc else ("#2ca02c" if is_active else "#dddddd")
-                dash = "dash" if is_ntc else "solid"
-                name = "NTC" if is_ntc else f"{format_dilution(w_r['Dilution_Factor'])} ({w})"
-                f_melt.add_trace(go.Scatter(x=temp_x, y=melt_df[w].values, mode="lines", name=name,
-                                            line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
-    f_melt.update_layout(title="Melt peaks (-d(RFU)/dT)", xaxis_title="Temp (°C)", yaxis_title="-d(RFU)/dT", height=380, showlegend=False)
-    st.plotly_chart(f_melt, width="stretch")
-
-# 3. Standard Curve
-with c_p3:
-    f_std = go.Figure()
-    if len(filtered_grp) >= 3:
-        act_x = -np.log10(filtered_grp["Dilution_Factor"].values)
-        act_y = filtered_grp["mean"].values
-        act_sd = filtered_grp["std"].fillna(0).values
-
-        f_std.add_trace(go.Scatter(
-            x=act_x, y=act_y, mode="markers",
-            error_y=dict(type="data", array=act_sd, visible=True),
-            marker=dict(size=10, color="#1F4E79"),
-            hovertext=[f"Dilution: {format_dilution(d)}<br>Mean Cq: {m:.2f} ± {s:.2f}<br>Active wells: {int(c)}" 
-                       for d, m, s, c in zip(filtered_grp["Dilution_Factor"], act_y, act_sd, filtered_grp["count"])],
-            hoverinfo="text",
-            name="Active points"
-        ))
-
-        x_line = np.linspace(min(act_x) - 0.2, max(act_x) + 0.2, 50)
-        y_line = sl_live * x_line + int_live
-        f_std.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", line=dict(color="#C00000", width=2), name="Fit"))
-
-    std_title = "Standard curve (need ≥ 3 points)" if np.isnan(eff_live) else f"Standard curve (Eff={eff_live:.1f}%, R²={r2_live:.3f})"
-    f_std.update_layout(title=std_title, xaxis_title="Log10 rel conc", yaxis_title="Cq", height=380, showlegend=False)
-    st.plotly_chart(f_std, width="stretch")
+        with c_p3:
+            f_std = go.Figure()
+            g = res["grp_sel"]
+            if len(g) >= 3:
+                act_x = -np.log10(g["Dilution_Factor"].values)
+                act_y = g["mean"].values
+                act_sd = g["std"].fillna(0).values
+                f_std.add_trace(go.Scatter(
+                    x=act_x, y=act_y, mode="markers",
+                    error_y=dict(type="data", array=act_sd, visible=True),
+                    marker=dict(size=10, color="#1F4E79"),
+                    hovertext=[f"Dilution: {format_dilution(d)}<br>Mean Cq: {m:.2f} ± {s:.2f}<br>Active wells: {int(c)}"
+                               for d, m, s, c in zip(g["Dilution_Factor"], act_y, act_sd, g["count"])],
+                    hoverinfo="text", name="Active points"))
+                x_line = np.linspace(min(act_x) - 0.2, max(act_x) + 0.2, 50)
+                f_std.add_trace(go.Scatter(x=x_line, y=res["slope"] * x_line + res["intercept"], mode="lines",
+                                           line=dict(color="#C00000", width=2), name="Fit"))
+            std_title = ("Standard curve (need ≥ 3 points)" if np.isnan(res["eff"])
+                         else f"Standard curve (Eff={res['eff']:.1f}%, R²={res['r2']:.3f})")
+            f_std.update_layout(title=std_title, xaxis_title="Log10 rel conc", yaxis_title="Cq", height=380, showlegend=False)
+            st.plotly_chart(f_std, width="stretch", key=f"std_{k}")
