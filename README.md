@@ -8,6 +8,8 @@
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io)
 [![Plotly](https://img.shields.io/badge/Plots-Plotly-3F4F75.svg)](https://plotly.com)
 
+https://qpcr-primer-validation.streamlit.app/
+
 ---
 
 ## The 30-Second Workflow
