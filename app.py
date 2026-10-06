@@ -34,6 +34,19 @@ def parse_dilution_value(val_str: str) -> float:
     return float(s)
 
 
+def format_dilution(val) -> str:
+    """Safely format dilution factors into clean strings without NaN crashes."""
+    if pd.isna(val) or val is None:
+        return "Unknown"
+    try:
+        f_val = float(val)
+        if f_val.is_integer():
+            return f"1/{int(f_val)}"
+        return f"1/{f_val:.1f}"
+    except (ValueError, TypeError):
+        return str(val)
+
+
 def find_files_recursively(base_dir: str):
     """
     Search recursively for Bio-Rad files and user plate layouts.
@@ -96,7 +109,6 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     COPY_PASTE_10X_MAP = {"1": 1.0, "4": 10.0, "16": 100.0, "64": 1000.0, "256": 10000.0}
 
     for r_letter in rows_letters:
-        # Find which row corresponds to row letter (A, B, C...)
         row_match = df_raw[df_raw.iloc[:, 0].str.strip().str.upper() == r_letter]
         start_col_offset = 1
         if row_match.empty and df_raw.shape[1] > 1:
@@ -105,18 +117,16 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
 
         row_idx = row_match.index[0] if not row_match.empty else None
 
-        # Process exactly 12 columns (1 to 12)
         for col_idx in range(1, 13):
             well_id = f"{r_letter}{col_idx:02d}"
             tag = ""
 
-            # Check if this cell physically exists in user spreadsheet
             if row_idx is not None:
                 actual_col = start_col_offset + (col_idx - 1)
                 if actual_col < df_raw.shape[1]:
                     tag = df_raw.iloc[row_idx, actual_col].strip()
 
-            # If empty (nothing pipetted into well)
+            # Empty unpipetted well
             if not tag or tag.lower() in ["empty", "unused", "none", "nan", "-"]:
                 records.append({
                     "Well": well_id,
@@ -131,7 +141,6 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
                 })
                 continue
 
-            # Parse non-empty pipetted well
             parts = [p.strip() for p in tag.split("_") if p.strip()]
 
             if len(parts) >= 3:
@@ -161,13 +170,14 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
                 "Col": col_idx,
                 "Primer": primer,
                 "Series": series,
-                "Tag": tag,
+                "Tag": tag.strip(),
                 "Dilution_Factor": factor,
                 "Is_NTC": is_ntc,
                 "Is_Empty": False
             })
 
     return pd.DataFrame(records)
+
 
 def clean_matrix_file(filepath: str, axis_name: str) -> pd.DataFrame:
     """Clean curve data matrices and drop duplicate columns."""
@@ -226,7 +236,8 @@ def generate_synthetic_demo_data():
 
             records.append({
                 "Well": well, "Row": r, "Col": c, "Primer": primer, "Series": "10x",
-                "Tag": tag, "Dilution_Factor": dil_val, "Is_NTC": is_ntc, "Cq": cq
+                "Tag": tag, "Dilution_Factor": dil_val, "Is_NTC": is_ntc, "Cq": cq,
+                "Is_Empty": False
             })
 
     merged_df = pd.DataFrame(records)
@@ -269,6 +280,7 @@ with st.sidebar:
     run_name = "qPCR_Run"
 
     if not use_demo:
+        # Default to ZIP upload first
         input_mode = st.radio("Input mode:", ["Upload ZIP archive", "Local folder"])
         
         if input_mode == "Upload ZIP archive":
@@ -283,7 +295,6 @@ with st.sidebar:
                 active_data_dir = temp_dir_obj.name
                 run_name = os.path.splitext(uploaded_zip.name)[0]
         else:
-            # Smart Folder Path with detected subfolders
             current_exec_dir = os.getcwd()
             detected_dirs = []
             for root, dirs, _ in os.walk(current_exec_dir):
@@ -292,7 +303,6 @@ with st.sidebar:
                     if not rel_p.startswith(".") and "env" not in rel_p and "git" not in rel_p:
                         detected_dirs.append(rel_p)
 
-            # Quick helper dropdown
             selected_sub = st.selectbox(
                 "Quick folder pick (optional):", 
                 ["Current directory"] + sorted(detected_dirs)[:15]
@@ -356,7 +366,14 @@ else:
 st.title(f"🧬 qPCR primer validation: {run_name}")
 st.caption(f"Layout source: `{layout_name}` | Rows: 8 (A-H) | Columns: 12 (1-12)")
 
-conditions = merged_df[["Primer", "Series"]].drop_duplicates().sort_values(by=["Primer", "Series"])
+# Filter out empty wells from all downstream statistics
+valid_df = merged_df[~merged_df["Is_Empty"] & (merged_df["Primer"] != "Empty")].copy()
+
+if valid_df.empty:
+    st.warning("⚠️ No valid primer targets detected on the plate.")
+    st.stop()
+
+conditions = valid_df[["Primer", "Series"]].drop_duplicates().sort_values(by=["Primer", "Series"])
 
 # ----------------- SECTION 1: EXECUTIVE SUMMARY -----------------
 st.markdown("### 📊 Executive summary & recommendations")
@@ -364,7 +381,7 @@ st.markdown("### 📊 Executive summary & recommendations")
 summary_records = []
 for _, c_r in conditions.iterrows():
     p, s = c_r["Primer"], c_r["Series"]
-    sub_c = merged_df[(merged_df["Primer"] == p) & (merged_df["Series"] == s)]
+    sub_c = valid_df[(valid_df["Primer"] == p) & (valid_df["Series"] == s)]
     
     ntc_val = sub_c[sub_c["Is_NTC"]]["Cq"].mean()
     ntc_stat = "Clean" if pd.isna(ntc_val) else (f"Pass ({ntc_val:.1f})" if ntc_val >= 35 else f"High ({ntc_val:.1f})")
@@ -382,7 +399,7 @@ for _, c_r in conditions.iterrows():
         if len(g_trim) >= 3:
             s_t, _, r2_t, eff_t = calc_stats(-np.log10(g_trim["Dilution_Factor"].values), g_trim["Cq"].values)
             if 90 <= eff_t <= 110 and r2_t >= 0.98:
-                action = f"Exclude 1/{int(g_c.iloc[-1]['Dilution_Factor'])} (plateau/LOQ)"
+                action = f"Exclude {format_dilution(g_c.iloc[-1]['Dilution_Factor'])} (plateau/LOQ)"
                 s_opt, r2_opt, eff_opt = s_t, r2_t, eff_t
 
     summary_records.append({
@@ -413,14 +430,15 @@ with col_dl1:
 with col_dl2:
     excel_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
     with pd.ExcelWriter(excel_tmp.name, engine="openpyxl") as writer:
-        # Sheet 1: Executive Summary
         sum_table.to_excel(writer, sheet_name="Executive_Summary", index=False)
 
-        # Sheet 2: 96-Well Plate Map (Layout + Cq)
+        # Sheet 2: 96-Well Plate Map (Guaranteed 8x12 grid via reindex)
         ws_plate = writer.book.create_sheet(title="Plate_96_Map")
-        plate_cq_grid = merged_df.pivot(index="Row", columns="Col", values="Cq")
-        plate_tag_grid = merged_df.pivot(index="Row", columns="Col", values="Tag")
         rows_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
+        cols_numbers = list(range(1, 13))
+
+        plate_cq_grid = merged_df.pivot(index="Row", columns="Col", values="Cq").reindex(index=rows_letters, columns=cols_numbers)
+        plate_tag_grid = merged_df.pivot(index="Row", columns="Col", values="Tag").reindex(index=rows_letters, columns=cols_numbers)
 
         hdr_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
         hdr_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -437,7 +455,8 @@ with col_dl2:
         for r_idx, r_let in enumerate(rows_letters, start=4):
             ws_plate.cell(row=r_idx, column=1, value=r_let).font = Font(bold=True)
             for c_idx in range(1, 13):
-                cell = ws_plate.cell(row=r_idx, column=c_idx + 1, value=plate_tag_grid.loc[r_let, c_idx])
+                tag_val = plate_tag_grid.loc[r_let, c_idx]
+                cell = ws_plate.cell(row=r_idx, column=c_idx + 1, value="" if pd.isna(tag_val) or tag_val == "Empty" else str(tag_val))
                 cell.border = border; cell.alignment = Alignment(horizontal="center")
 
         # 2. Cq Map
@@ -460,9 +479,8 @@ with col_dl2:
                     cell.number_format = "0.00"
 
         # Sheet 3: Raw Wells
-        merged_df[["Well", "Row", "Col", "Primer", "Series", "Tag", "Cq", "Is_NTC"]].to_excel(writer, sheet_name="Raw_Wells", index=False)
+        merged_df[["Well", "Row", "Col", "Primer", "Series", "Tag", "Cq", "Is_NTC", "Is_Empty"]].to_excel(writer, sheet_name="Raw_Wells", index=False)
 
-        # Auto width
         for ws in [writer.sheets["Executive_Summary"], writer.sheets["Plate_96_Map"], writer.sheets["Raw_Wells"]]:
             for col in ws.columns:
                 max_len = max(len(str(c.value or "")) for c in col)
@@ -496,10 +514,14 @@ for r_idx, r_let in enumerate(rows_order):
         if not match.empty:
             val = match.iloc[0]["Cq"]
             tag = match.iloc[0]["Tag"]
+            is_emp = match.iloc[0].get("Is_Empty", False)
             cq_matrix[r_idx, c_idx] = val
             
-            # Smart contrast text annotation: white text on dark blue (val < 27), dark on light
-            if pd.isna(val):
+            if is_emp or tag == "Empty":
+                txt = "—"
+                font_col = "#AAAAAA"
+                hover_matrix[r_idx, c_idx] = f"Well: <b>{well_id}</b><br><i>Unused (Empty)</i>"
+            elif pd.isna(val):
                 txt = "—"
                 font_col = "#888888"
                 hover_matrix[r_idx, c_idx] = f"Well: <b>{well_id}</b><br>Sample: {tag}<br><i>No amplification</i>"
@@ -550,7 +572,7 @@ with col_p_sel:
 
 sel_p, sel_s = selected_cond.split(" ")
 sel_s = sel_s.replace("(", "").replace(")", "")
-cond_data = merged_df[(merged_df["Primer"] == sel_p) & (merged_df["Series"] == sel_s)].copy()
+cond_data = valid_df[(valid_df["Primer"] == sel_p) & (valid_df["Series"] == sel_s)].copy()
 
 valid_wells_sub = cond_data[~cond_data["Is_NTC"]].dropna(subset=["Cq"])
 grp_pts = valid_wells_sub.groupby("Dilution_Factor")["Cq"].mean().reset_index()
@@ -565,10 +587,10 @@ if not np.isnan(eff_init) and not (90 <= eff_init <= 110 and r2_init >= 0.98):
     if len(g_trim) >= 3:
         st_i, _, r2t_i, efft_i = calc_stats(-np.log10(g_trim["Dilution_Factor"].values), g_trim["Cq"].values)
         if 90 <= efft_i <= 110 and r2t_i >= 0.98:
-            rec_drop = int(grp_pts.iloc[-1]["Dilution_Factor"])
-            adv_msg = f"💡 **Smart advice:** Dilution 1/{rec_drop} reached the limit of quantification (plateau). Excluding it yields **Eff: {efft_i:.1f}%** and **R²: {r2t_i:.4f}** (optimal!)."
+            rec_drop = g_trim.iloc[-1]["Dilution_Factor"]
+            adv_msg = f"💡 **Smart advice:** Dilution {format_dilution(grp_pts.iloc[-1]['Dilution_Factor'])} reached the limit of quantification (plateau). Excluding it yields **Eff: {efft_i:.1f}%** and **R²: {r2t_i:.4f}** (optimal!)."
 
-if rec_drop:
+if rec_drop is not None:
     st.warning(adv_msg)
 else:
     st.success("✅ Standard curve satisfies standard guidelines (Eff 90-110%, R² >= 0.98).")
@@ -581,11 +603,11 @@ with st.expander("🛠️ Interactive well manager (toggle replicates)", expande
     for i, (_, w_row) in enumerate(valid_wells_sub.iterrows()):
         col_c = chk_cols[i % 5]
         def_val = True
-        if rec_drop and w_row["Dilution_Factor"] == rec_drop:
+        if rec_drop is not None and w_row["Dilution_Factor"] == grp_pts.iloc[-1]["Dilution_Factor"]:
             def_val = False  # Auto uncheck recommended outlier
 
         is_checked = col_c.checkbox(
-            f"{w_row['Well']} (1/{int(w_row['Dilution_Factor'])}): {w_row['Cq']:.2f}",
+            f"{w_row['Well']} ({format_dilution(w_row['Dilution_Factor'])}): Cq={w_row['Cq']:.2f}",
             value=def_val,
             key=f"w_chk_{w_row['Well']}"
         )
@@ -626,7 +648,7 @@ with c_p1:
                 is_active = w in active_well_list
                 col = "red" if is_ntc else ("#1f77b4" if is_active else "#dddddd")
                 dash = "dash" if is_ntc else "solid"
-                name = "NTC" if is_ntc else f"1/{int(w_r['Dilution_Factor'])} ({w})"
+                name = "NTC" if is_ntc else f"{format_dilution(w_r['Dilution_Factor'])} ({w})"
                 f_amp.add_trace(go.Scatter(x=cycles_x, y=amp_df[w].values, mode="lines", name=name,
                                            line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
     f_amp.update_layout(title="Amplification curves", xaxis_title="Cycle", yaxis_title="RFU", height=380, showlegend=False)
@@ -644,7 +666,7 @@ with c_p2:
                 is_active = w in active_well_list
                 col = "red" if is_ntc else ("#2ca02c" if is_active else "#dddddd")
                 dash = "dash" if is_ntc else "solid"
-                name = "NTC" if is_ntc else f"1/{int(w_r['Dilution_Factor'])} ({w})"
+                name = "NTC" if is_ntc else f"{format_dilution(w_r['Dilution_Factor'])} ({w})"
                 f_melt.add_trace(go.Scatter(x=temp_x, y=melt_df[w].values, mode="lines", name=name,
                                             line=dict(color=col, dash=dash, width=1.5 if is_active or is_ntc else 0.8)))
     f_melt.update_layout(title="Melt peaks (-d(RFU)/dT)", xaxis_title="Temp (°C)", yaxis_title="-d(RFU)/dT", height=380, showlegend=False)
@@ -662,7 +684,7 @@ with c_p3:
             x=act_x, y=act_y, mode="markers",
             error_y=dict(type="data", array=act_sd, visible=True),
             marker=dict(size=10, color="#1F4E79"),
-            hovertext=[f"Dilution: 1/{int(d)}<br>Mean Cq: {m:.2f} ± {s:.2f}<br>Active wells: {int(c)}" 
+            hovertext=[f"Dilution: {format_dilution(d)}<br>Mean Cq: {m:.2f} ± {s:.2f}<br>Active wells: {int(c)}" 
                        for d, m, s, c in zip(filtered_grp["Dilution_Factor"], act_y, act_sd, filtered_grp["count"])],
             hoverinfo="text",
             name="Active points"
