@@ -83,7 +83,7 @@ def find_files_recursively(base_dir: str):
 def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     """
     Parse 8x12 plate layout grid from Excel or CSV.
-    Cleans leading/trailing whitespace and accommodates copy-pasted 10x tags.
+    Safely handles empty/unpipetted wells without column shifting or KeyError.
     """
     if layout_filepath.endswith((".xlsx", ".xls")):
         df_raw = pd.read_excel(layout_filepath, header=None)
@@ -96,56 +96,78 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     COPY_PASTE_10X_MAP = {"1": 1.0, "4": 10.0, "16": 100.0, "64": 1000.0, "256": 10000.0}
 
     for r_letter in rows_letters:
+        # Find which row corresponds to row letter (A, B, C...)
         row_match = df_raw[df_raw.iloc[:, 0].str.strip().str.upper() == r_letter]
+        start_col_offset = 1
         if row_match.empty and df_raw.shape[1] > 1:
             row_match = df_raw[df_raw.iloc[:, 1].str.strip().str.upper() == r_letter]
+            start_col_offset = 2
 
-        if not row_match.empty:
-            row_data = row_match.iloc[0].tolist()
-            cells = [c.strip() for c in row_data if c.strip() and c.strip().upper() != r_letter]
-            for col_idx, tag in enumerate(cells[:12], start=1):
-                well_id = f"{r_letter}{col_idx:02d}"
-                parts = [p.strip() for p in tag.split("_") if p.strip()]
+        row_idx = row_match.index[0] if not row_match.empty else None
 
-                if len(parts) >= 3:
-                    primer = parts[0]
-                    series = parts[1]
-                    d_str = parts[2]
-                elif len(parts) == 2:
-                    primer = parts[0]
-                    series = "std"
-                    d_str = parts[1]
-                else:
-                    primer = parts[0] if parts else tag.strip()
-                    series = "std"
-                    d_str = "1"
+        # Process exactly 12 columns (1 to 12)
+        for col_idx in range(1, 13):
+            well_id = f"{r_letter}{col_idx:02d}"
+            tag = ""
 
-                is_ntc = d_str.upper() == "NTC"
-                factor = np.nan
+            # Check if this cell physically exists in user spreadsheet
+            if row_idx is not None:
+                actual_col = start_col_offset + (col_idx - 1)
+                if actual_col < df_raw.shape[1]:
+                    tag = df_raw.iloc[row_idx, actual_col].strip()
 
-                if not is_ntc:
-                    clean_s = series.lower().strip()
-                    clean_d = d_str.lower().strip()
-                    if "10" in clean_s and clean_d in COPY_PASTE_10X_MAP:
-                        factor = COPY_PASTE_10X_MAP[clean_d]
-                    else:
-                        try:
-                            factor = parse_dilution_value(clean_d)
-                        except ValueError:
-                            factor = np.nan
-
+            # If empty (nothing pipetted into well)
+            if not tag or tag.lower() in ["empty", "unused", "none", "nan", "-"]:
                 records.append({
                     "Well": well_id,
                     "Row": r_letter,
                     "Col": col_idx,
-                    "Primer": primer,
-                    "Series": series,
-                    "Tag": tag.strip(),
-                    "Dilution_Factor": factor,
-                    "Is_NTC": is_ntc
+                    "Primer": "Empty",
+                    "Series": "None",
+                    "Tag": "Empty",
+                    "Dilution_Factor": np.nan,
+                    "Is_NTC": False,
+                    "Is_Empty": True
                 })
-    return pd.DataFrame(records)
+                continue
 
+            # Parse non-empty pipetted well
+            parts = [p.strip() for p in tag.split("_") if p.strip()]
+
+            if len(parts) >= 3:
+                primer, series, d_str = parts[0], parts[1], parts[2]
+            elif len(parts) == 2:
+                primer, series, d_str = parts[0], "std", parts[1]
+            else:
+                primer, series, d_str = parts[0] if parts else tag, "std", "1"
+
+            is_ntc = d_str.upper() == "NTC"
+            factor = np.nan
+
+            if not is_ntc:
+                clean_s = series.lower().strip()
+                clean_d = d_str.lower().strip()
+                if "10" in clean_s and clean_d in COPY_PASTE_10X_MAP:
+                    factor = COPY_PASTE_10X_MAP[clean_d]
+                else:
+                    try:
+                        factor = parse_dilution_value(clean_d)
+                    except ValueError:
+                        factor = np.nan
+
+            records.append({
+                "Well": well_id,
+                "Row": r_letter,
+                "Col": col_idx,
+                "Primer": primer,
+                "Series": series,
+                "Tag": tag,
+                "Dilution_Factor": factor,
+                "Is_NTC": is_ntc,
+                "Is_Empty": False
+            })
+
+    return pd.DataFrame(records)
 
 def clean_matrix_file(filepath: str, axis_name: str) -> pd.DataFrame:
     """Clean curve data matrices and drop duplicate columns."""
