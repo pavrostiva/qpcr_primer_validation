@@ -418,6 +418,12 @@ def well_key(well: str) -> str:
     return f"w_chk_{run_name}_{well}"
 
 
+def toggle_dilution(wells, key) -> None:
+    """on_change callback: set every replicate of one dilution to the state of its row checkbox."""
+    for w in wells:
+        st.session_state[well_key(w)] = st.session_state[key]
+
+
 def analyze_condition(primer: str, series: str) -> dict:
     sub = valid_df[(valid_df["Primer"] == primer) & (valid_df["Series"] == series)]
     ntc = sub[sub["Is_NTC"]].sort_values("Well")
@@ -427,22 +433,28 @@ def analyze_condition(primer: str, series: str) -> dict:
     # All wells included
     grp_raw, _, _, r2_raw, eff_raw = fit_points(std)
 
-    # Smart LOQ advisor: does the curve pass without the most dilute point?
-    rec_factor, advice = None, ""
+    # Smart LOQ advisor: does the curve pass without the 1 or 2 most dilute points? (at least 3 points must remain)
+    rec_factors, advice = [], ""
     if not np.isnan(eff_raw) and not is_optimal(eff_raw, r2_raw):
-        trimmed = grp_raw.iloc[:-1]
-        if len(trimmed) >= 3:
+        for n_drop in (1, 2):
+            trimmed = grp_raw.iloc[:len(grp_raw) - n_drop]
+            if len(trimmed) < 3:
+                break
             _, _, r2_t, eff_t = calc_stats(-np.log10(trimmed["Dilution_Factor"].values), trimmed["mean"].values)
             if is_optimal(eff_t, r2_t):
-                rec_factor = grp_raw.iloc[-1]["Dilution_Factor"]
-                advice = (f"Smart advice: dilution {format_dilution(rec_factor)} reached the limit of quantification (plateau). "
-                          f"Excluding it gives Eff {eff_t:.1f}% and R² {r2_t:.4f}.")
+                rec_factors = list(grp_raw["Dilution_Factor"].iloc[len(grp_raw) - n_drop:])
+                names = " and ".join(format_dilution(f) for f in rec_factors)
+                advice = (f"Smart advice: the most dilute point{'s' if n_drop > 1 else ''} ({names}) "
+                          f"probably reached the limit of quantification (plateau). "
+                          f"Excluding {'them' if n_drop > 1 else 'it'} gives Eff {eff_t:.1f}% and R² {r2_t:.4f}.")
+                if len(trimmed) < 5:
+                    advice += f" Note: only {len(trimmed)} dilution points remain; MIQE recommends 5."
+                break
 
     # Current selection: checkbox state, defaulting to the advisor's recommendation
-    std["Active"] = [
-        st.session_state.get(well_key(w), not (rec_factor is not None and f == rec_factor))
-        for w, f in zip(std["Well"], std["Dilution_Factor"])
-    ]
+    for w, f in zip(std["Well"], std["Dilution_Factor"]):
+        st.session_state.setdefault(well_key(w), f not in rec_factors)
+    std["Active"] = [st.session_state[well_key(w)] for w in std["Well"]]
     std["Active"] = std["Active"].astype(bool)  # an empty list would give object dtype and break masking
     grp_sel, slope, intercept, r2, eff = fit_points(std[std["Active"]])
 
@@ -457,8 +469,9 @@ def analyze_condition(primer: str, series: str) -> dict:
         "eff_raw": eff_raw, "r2_raw": r2_raw, "grp_sel": grp_sel,
         "slope": slope, "intercept": intercept, "r2": r2, "eff": eff,
         "status": status_of(eff, r2), "ntc_label": ntc_label,
-        "rec_factor": rec_factor, "advice": advice,
-        "recommendation": f"Exclude {format_dilution(rec_factor)} (plateau/LOQ)" if rec_factor is not None else "Keep as-is",
+        "rec_factors": rec_factors, "advice": advice,
+        "no_cq_wells": list(sub[~sub["Is_NTC"] & sub["Cq"].isna()]["Well"]),
+        "recommendation": f"Exclude {', '.join(format_dilution(f) for f in rec_factors)} (plateau/LOQ)" if rec_factors else "Keep as-is",
         "n_active": int(std["Active"].sum()), "n_total": len(std),
         "excluded_wells": list(std.loc[~std["Active"], "Well"]),
     }
@@ -662,7 +675,7 @@ for res in results:
 
         if std.empty:
             st.error("No Cq values for this primer: no amplification detected in any sample well.")
-        elif res["rec_factor"] is not None:
+        elif res["rec_factors"]:
             st.warning("💡 " + res["advice"] + " Those wells are unticked by default; tick them back if you disagree.")
         elif res["status"] == "OPTIMAL":
             st.success("✅ Standard curve satisfies the guidelines (Eff 90-110%, R² >= 0.98).")
@@ -675,14 +688,25 @@ for res in results:
             st.caption(f"⚠️ {res['n_no_cq']} sample well(s) have no Cq.")
 
         with st.expander("🛠️ Interactive well manager (toggle replicates)", expanded=True):
-            st.write("Uncheck any replicate or dilution point to observe real-time recalculation:")
-            chk_cols = st.columns(5)
-            for i, (_, w_row) in enumerate(std.iterrows()):
-                chk_cols[i % 5].checkbox(
-                    f"{w_row['Well']} ({format_dilution(w_row['Dilution_Factor'])}): Cq={w_row['Cq']:.2f}",
-                    value=bool(w_row["Active"]),
-                    key=well_key(w_row["Well"]),
+            st.write("Tick or untick a whole dilution point (bold row), or single replicates below it. Results update at once.")
+            for dil, grp in std.groupby("Dilution_Factor"):
+                wells = list(grp["Well"])
+                all_on = bool(grp["Active"].all())
+                # the key carries the state so the row re-syncs when single wells are toggled
+                dkey = f"d_chk_{run_name}_{k}_{dil}_{int(all_on)}"
+                st.checkbox(
+                    f"**{format_dilution(dil)}**  ·  {int(grp['Active'].sum())}/{len(wells)} wells  ·  mean Cq {grp['Cq'].mean():.2f}",
+                    value=all_on, key=dkey, on_change=toggle_dilution, args=(wells, dkey),
                 )
+                for start in range(0, len(grp), 6):
+                    chunk = grp.iloc[start:start + 6]
+                    cols = st.columns(6)
+                    for col, (_, w_row) in zip(cols, chunk.iterrows()):
+                        col.checkbox(f"{w_row['Well']} · Cq {w_row['Cq']:.2f}", key=well_key(w_row["Well"]))
+            not_listed = [f"{r['Well']} (NTC, {'no Cq' if pd.isna(r['Cq']) else format(r['Cq'], '.2f')})" for _, r in res["ntc"].iterrows()]
+            not_listed += [f"{w} (no Cq)" for w in res["no_cq_wells"]]
+            if not_listed:
+                st.caption("Not listed because they are not part of the standard curve: " + ", ".join(not_listed))
 
         eff_delta = (f"{res['eff'] - res['eff_raw']:+.1f}% vs baseline"
                      if not np.isnan(res["eff_raw"]) and not np.isnan(res["eff"]) and res["n_active"] != res["n_total"] else None)

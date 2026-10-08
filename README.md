@@ -67,9 +67,9 @@ That's it. You get:
 
 ### Detection-limit advisor
 
-If a curve fails, the app checks whether it would pass without the **most dilute point**. A very dilute sample often drifts to the plateau of the assay's detection limit, which pushes efficiency above 100 %. If dropping that point brings the curve into range, the app says so, shows the improved numbers and unticks those wells for you. You can always tick them back.
+If a curve fails, the app checks whether it would pass without the **most dilute point(s)**. A very dilute sample often drifts to the plateau of the assay's detection limit, which pushes efficiency above 100 %. If dropping that point brings the curve into range, the app says so, shows the improved numbers and unticks those wells for you. You can always tick them back.
 
-The advisor only ever considers the single most dilute point. It is a hint, not a verdict: **dropping points must be reported in your methods.**
+The advisor tries removing the one or two most dilute points (at least 3 dilutions always remain, and it warns when fewer than the 5 recommended by MIQE are left). It is a hint, not a verdict: **dropping points must be reported in your methods.**
 
 ---
 
