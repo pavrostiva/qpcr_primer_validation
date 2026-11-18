@@ -16,6 +16,8 @@ from reportlab.lib.units import cm
 from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph,
                                 SimpleDocTemplate, Spacer, Table, TableStyle)
 
+from version import __version__
+
 NAVY = colors.HexColor("#1F4E79")
 GREY = colors.HexColor("#6B7280")
 LIGHT = colors.HexColor("#F3F4F6")
@@ -224,7 +226,7 @@ def _footer(run_name):
         canvas.saveState()
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(GREY)
-        canvas.drawString(MARGIN, 0.8 * cm, f"qPCR primer validation  |  {run_name}")
+        canvas.drawString(MARGIN, 0.8 * cm, f"qPCR primer validation v{__version__}  |  {run_name}")
         canvas.drawRightString(PAGE[0] - MARGIN, 0.8 * cm, f"Page {doc.page}")
         canvas.restoreState()
     return draw

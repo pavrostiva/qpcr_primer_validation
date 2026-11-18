@@ -14,6 +14,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from pdf_report import build_pdf_report
+from version import __date__, __version__
 
 st.set_page_config(
     page_title="qPCR primer validation",
@@ -325,6 +326,8 @@ with st.sidebar:
 
         st.markdown("---")
         st.info("📋 **Expected files:**\n- `*Quantification Cq Results.csv`\n- `*Quantification Amplification Results*.csv`\n- `*Melt Curve Derivative Results*.csv`\n- `plate.xlsx` (or layout file)")
+
+    st.caption(f"Version **{__version__}** · {__date__}")
 
 
 # ----------------- Data Loading -----------------
