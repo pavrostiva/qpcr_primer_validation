@@ -2,6 +2,9 @@
 
 The version is shown at the bottom of the sidebar and in the footer of every PDF page.
 
+## 1.3.0 (restored 2026-11-25)
+- The code was rolled back to the state of version 1.3.0 on request. The changes of 1.3.1 and 1.4.0 below are not in the running code any more. They stay in the git history (commits 31aa64a and 8de42e1) and can be restored.
+
 ## 1.4.0 (2026-11-25)
 - New buttons to drop the most dilute / the most concentrated dilution point, for one primer or for all primers at once, and to reset to the advisor's recommendation. At least 3 dilution points are always kept.
 - The Smart LOQ advisor now explains itself when dropping the most dilute point(s) cannot fix a curve, instead of staying silent.

@@ -100,9 +100,6 @@ def find_files_recursively(base_dir: str):
     return files_map
 
 
-BARE_NTC_WORDS = {"NTC", "WATER", "H2O", "NFW"}
-
-
 def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     """
     Parse 8x12 plate layout grid from Excel or CSV.
@@ -113,7 +110,7 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     else:
         df_raw = pd.read_csv(layout_filepath, header=None)
 
-    df_raw = df_raw.astype(object).where(df_raw.notna(), "").astype(str)
+    df_raw = df_raw.fillna("").astype(str)
     records = []
     rows_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
     COPY_PASTE_10X_MAP = {"1": 1.0, "4": 10.0, "16": 100.0, "64": 1000.0, "256": 10000.0}
@@ -153,14 +150,6 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
 
             parts = [p.strip() for p in tag.split("_") if p.strip()]
 
-            if len(parts) == 1 and parts[0].upper() in BARE_NTC_WORDS:
-                # no primer name in the tag: assigned to the nearest primer of the same row below
-                records.append({
-                    "Well": well_id, "Row": r_letter, "Col": col_idx, "Primer": None, "Series": None, "Tag": tag.strip(),
-                    "Dilution_Factor": np.nan, "Is_NTC": True, "Is_Empty": False
-                })
-                continue
-
             if len(parts) >= 3:
                 primer, series, d_str = "_".join(parts[:-2]), parts[-2], parts[-1]
             elif len(parts) == 2:
@@ -194,21 +183,7 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
                 "Is_Empty": False
             })
 
-    out = pd.DataFrame(records)
-    unassigned = []
-    for idx in out.index[out["Primer"].isna()]:
-        same_row = out[(out["Row"] == out.at[idx, "Row"]) & out["Primer"].notna() & ~out["Is_NTC"] & ~out["Is_Empty"]]
-        if same_row.empty:
-            unassigned.append(out.at[idx, "Well"])
-            continue
-        dist = (same_row["Col"] - out.at[idx, "Col"]).abs()
-        left_first = same_row.assign(d=dist, side=(same_row["Col"] > out.at[idx, "Col"]).astype(int)).sort_values(["d", "side"])
-        out.at[idx, "Primer"] = left_first.iloc[0]["Primer"]
-        out.at[idx, "Series"] = left_first.iloc[0]["Series"]
-    if unassigned:  # no primer in that row: leave these wells out
-        out.loc[out["Well"].isin(unassigned), ["Primer", "Series", "Tag", "Is_NTC", "Is_Empty"]] = ["Empty", "None", "Empty", False, True]
-    out.attrs["unassigned_ntc"] = unassigned
-    return out
+    return pd.DataFrame(records)
 
 
 def clean_matrix_file(filepath: str, axis_name: str) -> pd.DataFrame:
@@ -384,9 +359,6 @@ else:
         amp_df = clean_matrix_file(found["amp"], "Cycle")
         melt_df = clean_matrix_file(found["melt"], "Temperature")
         layout_df = parse_plate_file(found["layout"])
-        if layout_df.attrs.get("unassigned_ntc"):
-            st.warning("NTC well(s) " + ", ".join(layout_df.attrs["unassigned_ntc"]) + " have no primer in their row and were left out. "
-                       "Write the primer name in the tag, e.g. `H1_10x_NTC`.")
 
         if layout_df.empty:
             st.error("Failed to parse 8x12 plate layout. Please ensure rows are labeled A through H.")
@@ -449,32 +421,6 @@ def well_key(well: str) -> str:
     return f"w_chk_{run_name}_{well}"
 
 
-def dilution_groups(res: dict) -> list:
-    """[(dilution factor, [wells])] of one primer, from the most concentrated to the most dilute."""
-    return [(f, list(g["Well"])) for f, g in res["std"].groupby("Dilution_Factor")]
-
-
-def drop_end(groups_per_primer: list, end: str) -> None:
-    """on_click callback: untick the most dilute (or most concentrated) dilution that is still in use. Keeps 3 points."""
-    kept_back = False
-    for groups in groups_per_primer:
-        active = [ws for _, ws in groups if any(st.session_state.get(well_key(w), True) for w in ws)]
-        if len(active) <= 3:
-            kept_back = True
-            continue
-        for w in (active[-1] if end == "dilute" else active[0]):
-            st.session_state[well_key(w)] = False
-    if kept_back:
-        st.toast("At least 3 dilution points are kept for a standard curve.", icon="⚠️")
-
-
-def reset_selection(defaults_per_primer: list) -> None:
-    """on_click callback: back to the advisor's recommendation (everything ticked if there is none)."""
-    for defaults in defaults_per_primer:
-        for w, v in defaults.items():
-            st.session_state[well_key(w)] = v
-
-
 def toggle_dilution(wells, key) -> None:
     """on_change callback: set every replicate of one dilution to the state of its row checkbox."""
     for w in wells:
@@ -491,14 +437,13 @@ def analyze_condition(primer: str, series: str) -> dict:
     grp_raw, _, _, r2_raw, eff_raw = fit_points(std)
 
     # Smart LOQ advisor: does the curve pass without the 1 or 2 most dilute points? (at least 3 points must remain)
-    rec_factors, advice, tried = [], "", []
+    rec_factors, advice = [], ""
     if not np.isnan(eff_raw) and not is_optimal(eff_raw, r2_raw):
         for n_drop in (1, 2):
             trimmed = grp_raw.iloc[:len(grp_raw) - n_drop]
             if len(trimmed) < 3:
                 break
             _, _, r2_t, eff_t = calc_stats(-np.log10(trimmed["Dilution_Factor"].values), trimmed["mean"].values)
-            tried.append(f"without the {n_drop} most dilute point{'s' if n_drop > 1 else ''}: Eff {eff_t:.0f}%, R² {r2_t:.3f}")
             if is_optimal(eff_t, r2_t):
                 rec_factors = list(grp_raw["Dilution_Factor"].iloc[len(grp_raw) - n_drop:])
                 names = " and ".join(format_dilution(f) for f in rec_factors)
@@ -508,9 +453,6 @@ def analyze_condition(primer: str, series: str) -> dict:
                 if len(trimmed) < 5:
                     advice += f" Note: only {len(trimmed)} dilution points remain; MIQE recommends 5."
                 break
-        if not rec_factors and tried:
-            advice = ("Smart advice: dropping the most dilute point(s) does not fix this curve (" + "; ".join(tried) + "). "
-                      "The problem is not just a plateau at the end: check the dilution series and pipetting.")
 
     # Current selection: checkbox state, defaulting to the advisor's recommendation
     for w, f in zip(std["Well"], std["Dilution_Factor"]):
@@ -532,9 +474,7 @@ def analyze_condition(primer: str, series: str) -> dict:
         "status": status_of(eff, r2), "ntc_label": ntc_label,
         "rec_factors": rec_factors, "advice": advice,
         "no_cq_wells": list(sub[~sub["Is_NTC"] & sub["Cq"].isna()]["Well"]),
-        "recommendation": (f"Exclude {', '.join(format_dilution(f) for f in rec_factors)} (plateau/LOQ)" if rec_factors
-                          else ("Keep as-is (dropping 1-2 end points does not help)" if tried else "Keep as-is")),
-        "defaults": {w: f not in rec_factors for w, f in zip(std["Well"], std["Dilution_Factor"])},
+        "recommendation": f"Exclude {', '.join(format_dilution(f) for f in rec_factors)} (plateau/LOQ)" if rec_factors else "Keep as-is",
         "n_active": int(std["Active"].sum()), "n_total": len(std),
         "excluded_wells": list(std.loc[~std["Active"], "Well"]),
     }
@@ -546,33 +486,19 @@ results = [analyze_condition(r["Primer"], r["Series"]) for _, r in conditions.it
 st.markdown("### 📊 Executive summary")
 st.caption("All primers are analysed at once. Wells you untick below are reflected here, in the PDF and in the Excel report.")
 
-def na_label(r, selected: bool) -> str:
-    """Why there is no number: nothing amplified, or fewer than 3 dilution points are left."""
-    if r["std"].empty:
-        return "No Amp"
-    points = r["std"][r["std"]["Active"]]["Dilution_Factor"].nunique() if selected else r["std"]["Dilution_Factor"].nunique()
-    return "< 3 points" if points < 3 else "N/A"
-
-
 sum_table = pd.DataFrame([{
     "Primer": r["primer"],
     "Series": r["series"],
-    "Status": STATUS_ICON[r["status"]],
-    "Eff (%)": f"{r['eff']:.1f}%" if not np.isnan(r["eff"]) else na_label(r, True),
+    "Raw Eff (%)": f"{r['eff_raw']:.1f}%" if not np.isnan(r["eff_raw"]) else "No Amp",
+    "Raw R²": f"{r['r2_raw']:.4f}" if not np.isnan(r["r2_raw"]) else "N/A",
+    "Eff (%)": f"{r['eff']:.1f}%" if not np.isnan(r["eff"]) else "No Amp",
     "R²": f"{r['r2']:.4f}" if not np.isnan(r["r2"]) else "N/A",
     "Slope": f"{r['slope']:.3f}" if not np.isnan(r["slope"]) else "N/A",
-    "NTC QC": r["ntc_label"],
     "Wells used": f"{r['n_active']}/{r['n_total']}",
-    "Raw Eff (%)": f"{r['eff_raw']:.1f}%" if not np.isnan(r["eff_raw"]) else na_label(r, False),
-    "Raw R²": f"{r['r2_raw']:.4f}" if not np.isnan(r["r2_raw"]) else "N/A",
     "Smart recommendation": r["recommendation"],
+    "Status": STATUS_ICON[r["status"]],
+    "NTC QC": r["ntc_label"],
 } for r in results])
-g1, g2, g3, _ = st.columns([2, 2, 2, 3])
-g1.button("✂️ Drop most dilute point (all primers)", key="drop_dilute_all", on_click=drop_end,
-          args=([dilution_groups(r) for r in results], "dilute"), width="stretch")
-g2.button("✂️ Drop most concentrated point (all)", key="drop_conc_all", on_click=drop_end,
-          args=([dilution_groups(r) for r in results], "concentrated"), width="stretch")
-g3.button("↩️ Reset all", key="reset_all", on_click=reset_selection, args=([r["defaults"] for r in results],), width="stretch")
 st.dataframe(sum_table, width="stretch", hide_index=True)
 
 # Downloads: PDF (built on demand, it takes a few seconds) and Excel
@@ -664,7 +590,7 @@ with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
 
 with col_xls:
     st.download_button(
-        "📊 Excel report", data=excel_buf.getvalue(), file_name=f"{export_name}_report.xlsx",
+        "📊 Download Excel report", data=excel_buf.getvalue(), file_name=f"{export_name}_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
     )
 
@@ -759,19 +685,13 @@ for res in results:
         elif res["status"] == "NO DATA":
             st.info("Fewer than 3 dilution points selected: no standard curve can be fitted.")
         else:
-            st.error("Standard curve is outside the guidelines (Eff 90-110%, R² >= 0.98). " + (res["advice"] or ""))
+            st.error("Standard curve is outside the guidelines (Eff 90-110%, R² >= 0.98) and removing the last dilution does not fix it.")
 
         if res["n_no_cq"]:
             st.caption(f"⚠️ {res['n_no_cq']} sample well(s) have no Cq.")
 
         with st.expander("🛠️ Interactive well manager (toggle replicates)", expanded=True):
             st.write("Tick or untick a whole dilution point (bold row), or single replicates below it. Results update at once.")
-            b1, b2, b3, _ = st.columns([2, 2, 1.5, 3])
-            b1.button("✂️ Drop most dilute point", key=f"drop_dilute_{k}", on_click=drop_end,
-                      args=([dilution_groups(res)], "dilute"), width="stretch")
-            b2.button("✂️ Drop most concentrated point", key=f"drop_conc_{k}", on_click=drop_end,
-                      args=([dilution_groups(res)], "concentrated"), width="stretch")
-            b3.button("↩️ Reset", key=f"reset_{k}", on_click=reset_selection, args=([res["defaults"]],), width="stretch")
             for dil, grp in std.groupby("Dilution_Factor"):
                 wells = list(grp["Well"])
                 all_on = bool(grp["Active"].all())
