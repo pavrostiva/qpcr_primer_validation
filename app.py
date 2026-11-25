@@ -100,6 +100,9 @@ def find_files_recursively(base_dir: str):
     return files_map
 
 
+BARE_NTC_WORDS = {"NTC", "WATER", "H2O", "NFW"}
+
+
 def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     """
     Parse 8x12 plate layout grid from Excel or CSV.
@@ -110,7 +113,7 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
     else:
         df_raw = pd.read_csv(layout_filepath, header=None)
 
-    df_raw = df_raw.fillna("").astype(str)
+    df_raw = df_raw.astype(object).where(df_raw.notna(), "").astype(str)
     records = []
     rows_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
     COPY_PASTE_10X_MAP = {"1": 1.0, "4": 10.0, "16": 100.0, "64": 1000.0, "256": 10000.0}
@@ -150,6 +153,14 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
 
             parts = [p.strip() for p in tag.split("_") if p.strip()]
 
+            if len(parts) == 1 and parts[0].upper() in BARE_NTC_WORDS:
+                # no primer name in the tag: assigned to the nearest primer of the same row below
+                records.append({
+                    "Well": well_id, "Row": r_letter, "Col": col_idx, "Primer": None, "Series": None, "Tag": tag.strip(),
+                    "Dilution_Factor": np.nan, "Is_NTC": True, "Is_Empty": False
+                })
+                continue
+
             if len(parts) >= 3:
                 primer, series, d_str = "_".join(parts[:-2]), parts[-2], parts[-1]
             elif len(parts) == 2:
@@ -183,7 +194,21 @@ def parse_plate_file(layout_filepath: str) -> pd.DataFrame:
                 "Is_Empty": False
             })
 
-    return pd.DataFrame(records)
+    out = pd.DataFrame(records)
+    unassigned = []
+    for idx in out.index[out["Primer"].isna()]:
+        same_row = out[(out["Row"] == out.at[idx, "Row"]) & out["Primer"].notna() & ~out["Is_NTC"] & ~out["Is_Empty"]]
+        if same_row.empty:
+            unassigned.append(out.at[idx, "Well"])
+            continue
+        dist = (same_row["Col"] - out.at[idx, "Col"]).abs()
+        left_first = same_row.assign(d=dist, side=(same_row["Col"] > out.at[idx, "Col"]).astype(int)).sort_values(["d", "side"])
+        out.at[idx, "Primer"] = left_first.iloc[0]["Primer"]
+        out.at[idx, "Series"] = left_first.iloc[0]["Series"]
+    if unassigned:  # no primer in that row: leave these wells out
+        out.loc[out["Well"].isin(unassigned), ["Primer", "Series", "Tag", "Is_NTC", "Is_Empty"]] = ["Empty", "None", "Empty", False, True]
+    out.attrs["unassigned_ntc"] = unassigned
+    return out
 
 
 def clean_matrix_file(filepath: str, axis_name: str) -> pd.DataFrame:
@@ -359,6 +384,9 @@ else:
         amp_df = clean_matrix_file(found["amp"], "Cycle")
         melt_df = clean_matrix_file(found["melt"], "Temperature")
         layout_df = parse_plate_file(found["layout"])
+        if layout_df.attrs.get("unassigned_ntc"):
+            st.warning("NTC well(s) " + ", ".join(layout_df.attrs["unassigned_ntc"]) + " have no primer in their row and were left out. "
+                       "Write the primer name in the tag, e.g. `H1_10x_NTC`.")
 
         if layout_df.empty:
             st.error("Failed to parse 8x12 plate layout. Please ensure rows are labeled A through H.")
@@ -486,18 +514,26 @@ results = [analyze_condition(r["Primer"], r["Series"]) for _, r in conditions.it
 st.markdown("### 📊 Executive summary")
 st.caption("All primers are analysed at once. Wells you untick below are reflected here, in the PDF and in the Excel report.")
 
+def na_label(r, selected: bool) -> str:
+    """Why there is no number: nothing amplified, or fewer than 3 dilution points are left."""
+    if r["std"].empty:
+        return "No Amp"
+    points = r["std"][r["std"]["Active"]]["Dilution_Factor"].nunique() if selected else r["std"]["Dilution_Factor"].nunique()
+    return "< 3 points" if points < 3 else "N/A"
+
+
 sum_table = pd.DataFrame([{
     "Primer": r["primer"],
     "Series": r["series"],
-    "Raw Eff (%)": f"{r['eff_raw']:.1f}%" if not np.isnan(r["eff_raw"]) else "No Amp",
-    "Raw R²": f"{r['r2_raw']:.4f}" if not np.isnan(r["r2_raw"]) else "N/A",
-    "Eff (%)": f"{r['eff']:.1f}%" if not np.isnan(r["eff"]) else "No Amp",
+    "Status": STATUS_ICON[r["status"]],
+    "Eff (%)": f"{r['eff']:.1f}%" if not np.isnan(r["eff"]) else na_label(r, True),
     "R²": f"{r['r2']:.4f}" if not np.isnan(r["r2"]) else "N/A",
     "Slope": f"{r['slope']:.3f}" if not np.isnan(r["slope"]) else "N/A",
-    "Wells used": f"{r['n_active']}/{r['n_total']}",
-    "Smart recommendation": r["recommendation"],
-    "Status": STATUS_ICON[r["status"]],
     "NTC QC": r["ntc_label"],
+    "Wells used": f"{r['n_active']}/{r['n_total']}",
+    "Raw Eff (%)": f"{r['eff_raw']:.1f}%" if not np.isnan(r["eff_raw"]) else na_label(r, False),
+    "Raw R²": f"{r['r2_raw']:.4f}" if not np.isnan(r["r2_raw"]) else "N/A",
+    "Smart recommendation": r["recommendation"],
 } for r in results])
 st.dataframe(sum_table, width="stretch", hide_index=True)
 
@@ -590,7 +626,7 @@ with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
 
 with col_xls:
     st.download_button(
-        "📊 Download Excel report", data=excel_buf.getvalue(), file_name=f"{export_name}_report.xlsx",
+        "📊 Excel report", data=excel_buf.getvalue(), file_name=f"{export_name}_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
     )
 

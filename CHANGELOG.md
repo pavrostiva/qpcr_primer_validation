@@ -2,6 +2,11 @@
 
 The version is shown at the bottom of the sidebar and in the footer of every PDF page.
 
+## 1.3.1 (2026-11-25)
+- Fix: a layout cell that contains just `NTC` (or water / H2O / NFW) is now a negative control of the primer in the same row, not a primer named "NTC". The NTC check now works for such layouts.
+- Summary table: status and efficiency come first; "< 3 points" is shown instead of "No Amp" when too few dilutions are left.
+- Shorter Excel button label.
+
 ## 1.3.0 (2026-11-18)
 - Show the app version in the sidebar and in the PDF footer.
 - Well manager: tick or untick a whole dilution at once; wells that are not part of the curve are listed.
