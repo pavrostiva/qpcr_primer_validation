@@ -2,6 +2,10 @@
 
 The version is shown at the bottom of the sidebar and in the footer of every PDF page.
 
+## 1.4.0 (2026-11-25)
+- New buttons to drop the most dilute / the most concentrated dilution point, for one primer or for all primers at once, and to reset to the advisor's recommendation. At least 3 dilution points are always kept.
+- The Smart LOQ advisor now explains itself when dropping the most dilute point(s) cannot fix a curve, instead of staying silent.
+
 ## 1.3.1 (2026-11-25)
 - Fix: a layout cell that contains just `NTC` (or water / H2O / NFW) is now a negative control of the primer in the same row, not a primer named "NTC". The NTC check now works for such layouts.
 - Summary table: status and efficiency come first; "< 3 points" is shown instead of "No Amp" when too few dilutions are left.
